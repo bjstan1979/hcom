@@ -510,6 +510,87 @@ mod tests {
     }
 
     #[test]
+    fn start_handler_restores_stopped_identity_after_resume_deleted_placeholder() {
+        let (db, path) = setup_test_db();
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let mut canonical = serde_json::Map::new();
+        canonical.insert("name".into(), serde_json::json!("gona"));
+        canonical.insert("tool".into(), serde_json::json!("pi"));
+        canonical.insert("session_id".into(), serde_json::json!("sid-existing"));
+        canonical.insert("status".into(), serde_json::json!(ST_LISTENING));
+        canonical.insert("created_at".into(), serde_json::json!(1.0));
+        db.save_instance_named("gona", &canonical).unwrap();
+        db.log_life_event(
+            "gona",
+            "stopped",
+            "test",
+            "exit:quit",
+            Some(serde_json::json!({ "session_id": "sid-existing", "tool": "pi" })),
+        )
+        .unwrap();
+        db.delete_instance("gona").unwrap();
+
+        let mut placeholder = serde_json::Map::new();
+        placeholder.insert("name".into(), serde_json::json!("zora"));
+        placeholder.insert("tool".into(), serde_json::json!("pi"));
+        placeholder.insert("session_id".into(), serde_json::json!("sid-temporary"));
+        placeholder.insert("status".into(), serde_json::json!(ST_LISTENING));
+        placeholder.insert("created_at".into(), serde_json::json!(1.0));
+        db.save_instance_named("zora", &placeholder).unwrap();
+        db.set_process_binding("pid-resume", "sid-temporary", "zora")
+            .unwrap();
+        db.delete_instance("zora").unwrap();
+
+        let env = std::collections::HashMap::from([
+            ("HCOM_PROCESS_ID".to_string(), "pid-resume".to_string()),
+            ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+            ("HCOM_TOOL".to_string(), "pi".to_string()),
+        ]);
+        let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
+        let (code, output) = handle_start(
+            &ctx,
+            &db,
+            &[
+                "--session-id".to_string(),
+                "sid-existing".to_string(),
+                "--cwd".to_string(),
+                temp.path().to_string_lossy().to_string(),
+            ],
+        );
+
+        assert_eq!(code, 0);
+        let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            response.get("error"),
+            None,
+            "unexpected bind error: {output}"
+        );
+        assert_eq!(
+            response.get("name").and_then(|value| value.as_str()),
+            Some("gona")
+        );
+        assert_eq!(
+            db.get_session_binding("sid-existing").unwrap().as_deref(),
+            Some("gona")
+        );
+        assert_eq!(
+            db.get_process_binding("pid-resume").unwrap().as_deref(),
+            Some("gona")
+        );
+        assert_eq!(
+            db.get_instance_full("gona")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sid-existing")
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
     fn start_handler_uses_central_binding_for_existing_session() {
         let (db, path) = setup_test_db();
         let temp = tempfile::TempDir::new().unwrap();

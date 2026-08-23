@@ -369,7 +369,13 @@ fn normalize_terminal_mode_for_launch(
         if terminal_mode == "default"
             && let Some(detected) = detect_terminal_from_env()
         {
-            terminal_mode = detected;
+            // Environment detection can describe the host terminal rather than
+            // a launcher available to this HCOM process (notably WSL with
+            // WT_SESSION). Never carry an unavailable cross-platform preset
+            // into a fresh launch or session resume.
+            if terminal_preset_available(&detected) {
+                terminal_mode = detected;
+            }
         }
         if terminal_mode == "kitty" {
             if std::env::var("KITTY_WINDOW_ID")
@@ -406,7 +412,9 @@ fn normalize_terminal_mode_for_launch(
             kitty_socket = resolve_kitty_remote_socket(&kitty_socket);
         }
     } else if run_here {
-        if let Some(detected) = detect_terminal_from_env() {
+        if let Some(detected) = detect_terminal_from_env()
+            && terminal_preset_available(&detected)
+        {
             terminal_mode = detected;
         } else if terminal_mode == "here" {
             terminal_mode = "default".to_string();
@@ -414,6 +422,25 @@ fn normalize_terminal_mode_for_launch(
     }
 
     (terminal_mode, kitty_socket)
+}
+
+fn terminal_preset_available(name: &str) -> bool {
+    if name == "default" || name == "print" {
+        return true;
+    }
+
+    let system = platform::platform_name();
+    if let Some((_, preset)) = crate::shared::terminal_presets::TERMINAL_PRESETS
+        .iter()
+        .find(|(preset_name, _)| *preset_name == name)
+    {
+        return preset.platforms.contains(&system);
+    }
+
+    // Custom TOML presets have no platform declaration, so preserve the
+    // existing behavior for them; built-in cross-platform presets are checked
+    // above before environment detection is accepted.
+    crate::config::get_merged_preset(name).is_some()
 }
 
 pub fn resolve_terminal_mode_for_tips(
@@ -3148,6 +3175,22 @@ mod tests {
     /// `detect_terminal_from_env` must clear these explicitly so a host shell
     /// running inside herdr doesn't leak into the test.
     const DETECT_ONLY_VARS: &[&str] = &["HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_ENV"];
+
+    #[test]
+    #[serial]
+    fn test_unavailable_windows_terminal_detection_is_ignored_on_linux() {
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
+        unsafe {
+            std::env::set_var("WT_SESSION", "windows-session");
+            std::env::set_var("WSL_DISTRO_NAME", "Ubuntu");
+        }
+
+        let (mode, socket) = normalize_terminal_mode_for_launch("default".to_string(), true, false);
+
+        assert_ne!(mode, "windows-terminal");
+        assert!(socket.is_empty());
+    }
 
     #[test]
     #[serial]

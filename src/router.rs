@@ -1145,6 +1145,20 @@ mod tests {
     }
 
     #[test]
+    fn launch_pi_preserves_session_selector_flag() {
+        let action = resolve_action(&sv(&["pi", "-s"]));
+        assert_eq!(
+            action,
+            Action::Launch {
+                args: sv(&["pi", "-s"])
+            }
+        );
+        let (remaining, flags) = extract_global_flags(&sv(&["pi", "-s"]));
+        assert_eq!(remaining, sv(&["pi", "-s"]));
+        assert_eq!(flags, GlobalFlags::default());
+    }
+
+    #[test]
     fn launch_antigravity_direct() {
         let action = resolve_action(&sv(&["antigravity"]));
         assert_eq!(

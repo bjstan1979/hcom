@@ -86,6 +86,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
 static TEST_MIGRATE_NOTIFY_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_BIND_SESSION_PROCESS_FAIL: AtomicBool = AtomicBool::new(false);
 
 impl HcomDb {
     /// Delete process binding (for cleanup)
@@ -378,6 +380,80 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Atomically attach a live process and session to an existing instance.
+    ///
+    /// Resume uses this after recreating a stopped canonical row. Keeping the
+    /// instance session id, session binding, and process binding in one
+    /// transaction prevents a plugin from observing or reporting a half-bound
+    /// identity. The target instance must already exist; callers retain their
+    /// launch placeholder when this fails.
+    pub fn bind_session_process_atomic(
+        &self,
+        session_id: &str,
+        instance_name: &str,
+        process_id: Option<&str>,
+    ) -> Result<()> {
+        if session_id.is_empty() || instance_name.is_empty() {
+            bail!("session_id and instance_name are required for atomic binding");
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let target_exists = tx
+            .query_row(
+                "SELECT 1 FROM instances WHERE name = ? LIMIT 1",
+                params![instance_name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !target_exists {
+            bail!("cannot bind missing instance {instance_name}");
+        }
+        #[cfg(test)]
+        if TEST_BIND_SESSION_PROCESS_FAIL.load(Ordering::SeqCst) {
+            bail!("test_injected_bind_session_process_fail");
+        }
+
+        tx.execute(
+            "UPDATE instances SET session_id = NULL WHERE session_id = ? AND name != ?",
+            params![session_id, instance_name],
+        )?;
+        let updated = tx.execute(
+            "UPDATE instances SET session_id = ? WHERE name = ?",
+            params![session_id, instance_name],
+        )?;
+        if updated != 1 {
+            bail!("failed to attach session to instance {instance_name}");
+        }
+        tx.execute(
+            "DELETE FROM session_bindings WHERE instance_name = ? AND session_id != ?",
+            params![instance_name, session_id],
+        )?;
+        tx.execute(
+            "INSERT INTO session_bindings (session_id, instance_name, created_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 instance_name = excluded.instance_name,
+                 created_at = excluded.created_at",
+            params![session_id, instance_name, now_epoch_f64()],
+        )?;
+        if let Some(process_id) = process_id.filter(|value| !value.is_empty()) {
+            tx.execute(
+                "DELETE FROM process_bindings
+                 WHERE instance_name = ? AND process_id != ?",
+                params![instance_name, process_id],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO process_bindings
+                    (process_id, session_id, instance_name, updated_at)
+                 VALUES (?, ?, ?, ?)",
+                params![process_id, session_id, instance_name, now_epoch_f64()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Delete session binding.
     pub fn delete_session_binding(&self, session_id: &str) -> Result<()> {
         if session_id.is_empty() {
@@ -661,6 +737,10 @@ impl HcomDb {
     pub fn set_test_migrate_notify_fail(fail: bool) {
         TEST_MIGRATE_NOTIFY_FAIL.store(fail, Ordering::SeqCst);
     }
+
+    pub fn set_test_bind_session_process_fail(fail: bool) {
+        TEST_BIND_SESSION_PROCESS_FAIL.store(fail, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -820,6 +900,103 @@ mod tests {
         assert_eq!(
             db.get_session_binding("sess-1").unwrap(),
             Some("nova".to_string())
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_bind_session_process_atomic_commits_one_consistent_owner() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('luna', 'sess-old', 1000.0), ('nova', 'sess-new', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-old", "luna").unwrap();
+        db.set_session_binding("sess-new", "nova").unwrap();
+        db.set_process_binding("pid-old", "sess-old", "luna")
+            .unwrap();
+        db.set_process_binding("pid-current", "sess-temporary", "zora")
+            .unwrap();
+
+        db.bind_session_process_atomic("sess-new", "luna", Some("pid-current"))
+            .unwrap();
+
+        assert_eq!(
+            db.get_session_binding("sess-new").unwrap().as_deref(),
+            Some("luna")
+        );
+        assert_eq!(db.get_session_binding("sess-old").unwrap(), None);
+        assert_eq!(db.get_process_binding("pid-old").unwrap(), None);
+        assert_eq!(
+            db.get_process_binding_full("pid-current").unwrap(),
+            Some((Some("sess-new".to_string()), "luna".to_string()))
+        );
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sess-new")
+        );
+        assert_eq!(
+            db.get_instance_full("nova").unwrap().unwrap().session_id,
+            None
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bind_session_process_atomic_rolls_back_on_failure() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('luna', 'sess-old', 1000.0), ('nova', 'sess-new', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-old", "luna").unwrap();
+        db.set_session_binding("sess-new", "nova").unwrap();
+        db.set_process_binding("pid-current", "sess-temporary", "zora")
+            .unwrap();
+        let _failure = BindSessionProcessFailGuard::enable();
+
+        assert!(
+            db.bind_session_process_atomic("sess-new", "luna", Some("pid-current"))
+                .is_err()
+        );
+        assert_eq!(
+            db.get_session_binding("sess-new").unwrap().as_deref(),
+            Some("nova")
+        );
+        assert_eq!(
+            db.get_session_binding("sess-old").unwrap().as_deref(),
+            Some("luna")
+        );
+        assert_eq!(
+            db.get_process_binding("pid-current").unwrap().as_deref(),
+            Some("zora")
+        );
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sess-old")
+        );
+        assert_eq!(
+            db.get_instance_full("nova")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sess-new")
         );
 
         cleanup_test_db(db_path);
@@ -1257,6 +1434,21 @@ mod tests {
         assert_eq!(endpoint_count_for(&db, "mozi"), 0);
 
         cleanup_test_db(db_path);
+    }
+
+    struct BindSessionProcessFailGuard;
+
+    impl BindSessionProcessFailGuard {
+        fn enable() -> Self {
+            HcomDb::set_test_bind_session_process_fail(true);
+            Self
+        }
+    }
+
+    impl Drop for BindSessionProcessFailGuard {
+        fn drop(&mut self) {
+            HcomDb::set_test_bind_session_process_fail(false);
+        }
     }
 
     struct MigrateNotifyFailGuard;

@@ -918,6 +918,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_launch_argv_preserves_pi_session_selector_flag() {
+        let (_, tool, flags, args) = parse_launch_argv(&s(&["pi", "-s"])).unwrap();
+        assert_eq!(tool, "pi");
+        assert_eq!(flags, HcomLaunchFlags::default());
+        assert_eq!(args, s(&["-s"]));
+
+        let config = HcomConfig::default();
+        assert_eq!(merge_tool_args(&LaunchTool::Pi, &args, &config), s(&["-s"]));
+        assert!(crate::launcher::validate_tool_args(&LaunchTool::Pi, &args).is_empty());
+    }
+
+    #[test]
     fn test_parse_launch_argv_headless() {
         let (_, _, flags, _) = parse_launch_argv(&s(&["claude", "--headless"])).unwrap();
         assert!(flags.headless);

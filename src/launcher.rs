@@ -3371,6 +3371,30 @@ mod tests {
         std::fs::remove_file(env_file).ok();
     }
 
+    #[test]
+    #[cfg(not(windows))]
+    fn test_pi_runner_script_preserves_session_selector_flag() {
+        let script = create_runner_script(
+            "pi",
+            "/tmp",
+            "test-pi-session-selector",
+            &HashMap::new(),
+            &["-s".to_string()],
+            false,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        let run_line = content
+            .lines()
+            .find(|line| line.contains(" pty pi"))
+            .expect("runner must invoke hcom pty pi");
+        assert!(
+            run_line.trim_end().ends_with("pty pi -s"),
+            "Pi session selector was dropped from runner: {run_line}"
+        );
+        std::fs::remove_file(script).ok();
+    }
+
     // create_runner_script_windows() isn't cfg(windows)-gated (only its call
     // site is, via a runtime cfg!(windows) check), so this runs on any host.
     #[test]

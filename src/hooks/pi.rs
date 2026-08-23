@@ -473,6 +473,16 @@ mod tests {
     }
 
     #[test]
+    fn plugin_persists_delivery_ids_across_reload() {
+        assert!(PLUGIN_SOURCE.contains("pi-delivery"));
+        assert!(PLUGIN_SOURCE.contains("deliveredMessageIds"));
+        assert!(PLUGIN_SOURCE.contains("loadDeliveryLedger(transcriptPath ?? undefined)"));
+        assert!(PLUGIN_SOURCE.contains("rememberDelivered(pending.messages)"));
+        assert!(PLUGIN_SOURCE.contains("!deliveredMessageIds.has(Number(m.event_id))"));
+        assert!(PLUGIN_SOURCE.contains("--ack\", \"--up-to"));
+    }
+
+    #[test]
     fn status_handler_wakes_plugin_only_when_entering_listening() {
         let (db, path) = setup_test_db();
         save_test_instance(&db, "luna", ST_LISTENING);

@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, InputEvent } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
@@ -92,6 +92,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	let lastPendingPollAt = 0;
 	let agentActive = false;
 	let idleTimer: ReturnType<typeof setTimeout> | null = null;
+	let deliveredMessageIds = new Set<number>();
 
 	const PENDING_POLL_MS = 60_000;
 	const FALLBACK_PENDING_POLL_MS = 5_000;
@@ -100,6 +101,66 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	function statusKey(status: string, context: string, detail: string): string {
 		return `${status}\0${context}\0${detail}`;
+	}
+
+	function deliveryLedgerPath(): string | null {
+		if (!sessionId) return null;
+		const safe = sessionId.replace(/[^A-Za-z0-9_.-]/g, "_");
+		return `${HCOM_DIR}/pi-delivery/${safe}.json`;
+	}
+
+	function saveDeliveryLedger(): void {
+		const path = deliveryLedgerPath();
+		if (!path) return;
+		try {
+			mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+			writeFileSync(path, JSON.stringify([...deliveredMessageIds].slice(-2048)), { mode: 0o600 });
+		} catch (error) {
+			log("WARN", "plugin.delivery_ledger_failed", instanceName, { error: String(error) });
+		}
+	}
+
+	function loadDeliveryLedger(transcriptPath?: string): void {
+		deliveredMessageIds = new Set<number>();
+		const path = deliveryLedgerPath();
+		if (!path) return;
+		let ledgerLoaded = false;
+		try {
+			const value = JSON.parse(readFileSync(path, "utf8"));
+			if (Array.isArray(value)) {
+				for (const id of value.slice(-2048)) if (Number.isSafeInteger(id) && id > 0) deliveredMessageIds.add(id);
+				ledgerLoaded = true;
+			}
+		} catch {}
+		if (ledgerLoaded || !transcriptPath) return;
+		// Migrate messages injected before the ledger existed. Only actual HCOM
+		// user messages count; tool output and assistant quotations are ignored.
+		try {
+			for (const line of readFileSync(transcriptPath, "utf8").split("\n")) {
+				if (!line.includes('\"role\":\"user\"') || !line.includes("<hcom>")) continue;
+				const record = JSON.parse(line);
+				const content = record?.message?.content;
+				if (!Array.isArray(content)) continue;
+				for (const item of content) {
+					if (item?.type !== "text" || typeof item.text !== "string" || !item.text.includes("<hcom>")) continue;
+					for (const match of item.text.matchAll(/#(\d+)\]/g)) {
+						const id = Number(match[1]);
+						if (Number.isSafeInteger(id) && id > 0) deliveredMessageIds.add(id);
+					}
+				}
+			}
+			if (deliveredMessageIds.size > 0) saveDeliveryLedger();
+		} catch (error) {
+			log("WARN", "plugin.delivery_ledger_migration_failed", instanceName, { error: String(error) });
+		}
+	}
+
+	function rememberDelivered(messages: any[]): void {
+		for (const message of messages) {
+			const id = Number(message.event_id);
+			if (Number.isSafeInteger(id) && id > 0) deliveredMessageIds.add(id);
+		}
+		saveDeliveryLedger();
 	}
 
 	function isBoundSession(candidateSessionId?: string | null): boolean {
@@ -164,6 +225,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				}
 				instanceName = json.name;
 				sessionId = json.session_id || sid;
+				loadDeliveryLedger(transcriptPath ?? undefined);
 				bootstrapText = typeof json.bootstrap === "string" ? json.bootstrap : null;
 				log("INFO", "plugin.bound", instanceName, {
 					session_id: sessionId,
@@ -197,7 +259,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		if (!Array.isArray(messages) || messages.length === 0) return null;
 		const maxId = Math.max(...messages.map((m: any) => m.event_id || 0));
 		if (maxId <= 0) return null;
-		return { messages, maxId };
+		return { messages: messages.filter((m: any) => !deliveredMessageIds.has(Number(m.event_id))), maxId };
 	}
 
 	async function deliverPending(ctx: ExtensionContext): Promise<boolean> {
@@ -221,6 +283,10 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		try {
 			const pending = await fetchPending();
 			if (!pending) return false;
+			if (pending.messages.length === 0) {
+				await hcom(["pi-read", "--name", instanceName, "--ack", "--up-to", String(pending.maxId)]);
+				return false;
+			}
 			const formatted = formatMessagesForInjection(pending.messages, instanceName);
 			pendingAckId = pending.maxId;
 			try {
@@ -229,6 +295,9 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				} else {
 					pi.sendUserMessage(formatted, { deliverAs: "followUp" });
 				}
+				// Pi accepted the injection; persist before status/ack subprocesses so
+				// reload cannot reopen a duplicate-delivery window.
+				rememberDelivered(pending.messages);
 				const sender = String(pending.messages[0]?.from ?? "");
 				await reportStatus(ctx, "active", sender ? `deliver:${sender}` : "deliver");
 				await ackPending(ctx.isIdle() ? "sendUserMessage:idle" : "sendUserMessage:followUp");
@@ -343,6 +412,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		deliveryPending = false;
 		deliveryRetryScheduled = false;
 		bootstrapInjectedForSession = null;
+		deliveredMessageIds = new Set<number>();
 		lastReportedStatusKey = null;
 		lastListeningHeartbeatAt = 0;
 		lastPendingPollAt = 0;
@@ -381,9 +451,13 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		}
 		if (isBodylessWake(event.text) && pendingAckId === null) {
 			const pending = await fetchPending();
-			if (pending) {
+			if (pending?.messages.length) {
 				pendingAckId = pending.maxId;
+				rememberDelivered(pending.messages);
 				return { action: "transform", text: formatMessagesForInjection(pending.messages, instanceName) };
+			}
+			if (pending && pending.messages.length === 0) {
+				await hcom(["pi-read", "--name", instanceName, "--ack", "--up-to", String(pending.maxId)]);
 			}
 			return { action: "handled" };
 		}

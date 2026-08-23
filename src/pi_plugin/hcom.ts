@@ -88,12 +88,14 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	let reconcileInFlight = false;
 	let bootstrapInjectedForSession: string | null = null;
 	let lastReportedStatusKey: string | null = null;
+	let lastListeningHeartbeatAt = 0;
 	let lastPendingPollAt = 0;
 	let agentActive = false;
 	let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
 	const PENDING_POLL_MS = 60_000;
 	const FALLBACK_PENDING_POLL_MS = 5_000;
+	const LISTENING_HEARTBEAT_MS = 20_000;
 	const IDLE_DEBOUNCE_MS = 250;
 
 	function statusKey(status: string, context: string, detail: string): string {
@@ -287,11 +289,13 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		if (detail) args.push("--detail", detail);
 		await hcom(args);
 		lastReportedStatusKey = statusKey(status, context, detail);
+		if (status === "listening") lastListeningHeartbeatAt = Date.now();
 	}
 
 	async function reportReconciledStatus(ctx: ExtensionContext): Promise<void> {
 		const key = statusKey("listening", "", "");
-		if (lastReportedStatusKey !== key) {
+		const heartbeatDue = Date.now() - lastListeningHeartbeatAt >= LISTENING_HEARTBEAT_MS;
+		if (lastReportedStatusKey !== key || heartbeatDue) {
 			await reportStatus(ctx, "listening");
 		}
 	}
@@ -340,6 +344,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		deliveryRetryScheduled = false;
 		bootstrapInjectedForSession = null;
 		lastReportedStatusKey = null;
+		lastListeningHeartbeatAt = 0;
 		lastPendingPollAt = 0;
 		agentActive = false;
 		clearIdleTimer();

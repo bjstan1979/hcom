@@ -453,12 +453,15 @@ mod tests {
     }
 
     #[test]
-    fn plugin_reconcile_does_not_report_active_polling_status() {
+    fn plugin_reconcile_keeps_idle_workers_alive_without_active_polling() {
         assert!(!PLUGIN_SOURCE.contains(
             "reportStatus(currentCtx, currentCtx.isIdle() ? \"listening\" : \"active\")"
         ));
         assert!(PLUGIN_SOURCE.contains("pi.on(\"agent_end\""));
         assert!(PLUGIN_SOURCE.contains("IDLE_DEBOUNCE_MS"));
+        assert!(PLUGIN_SOURCE.contains("LISTENING_HEARTBEAT_MS = 20_000"));
+        assert!(PLUGIN_SOURCE.contains("lastListeningHeartbeatAt"));
+        assert!(PLUGIN_SOURCE.contains("heartbeatDue"));
         assert!(PLUGIN_SOURCE.contains("currentCtx?.isIdle()"));
         assert!(!PLUGIN_SOURCE.contains("pi.on(\"turn_end\", async (_event, ctx) => {\n\t\tcurrentCtx = ctx;\n\t\tawait reportStatus(ctx, \"listening\");"));
     }

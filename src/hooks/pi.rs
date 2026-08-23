@@ -475,6 +475,8 @@ mod tests {
     #[test]
     fn plugin_persists_delivery_ids_across_reload() {
         assert!(PLUGIN_SOURCE.contains("pi-delivery"));
+        assert!(PLUGIN_SOURCE.contains("closed-workers.json"));
+        assert!(PLUGIN_SOURCE.contains("isClosedSupervisionWorker"));
         assert!(PLUGIN_SOURCE.contains("deliveredMessageIds"));
         assert!(PLUGIN_SOURCE.contains("loadDeliveryLedger(transcriptPath ?? undefined)"));
         assert!(PLUGIN_SOURCE.contains("rememberDelivered(pending.messages)"));

@@ -72,6 +72,17 @@ function isBodylessWake(text: string): boolean {
 	return trimmed === "<hcom>" || trimmed === "<hcom></hcom>";
 }
 
+function closedWorkerMarkerPath(): string {
+	return `${HCOM_DIR}/pi-supervisor/closed-workers.json`;
+}
+
+function isClosedSupervisionWorker(worker: string): boolean {
+	try {
+		const entries = JSON.parse(readFileSync(closedWorkerMarkerPath(), "utf8")) as Array<{ worker: string; expiresAt: number }>;
+		return entries.some((entry) => entry.worker === worker && entry.expiresAt > Date.now());
+	} catch { return false; }
+}
+
 export default function hcomExtension(pi: ExtensionAPI) {
 	let instanceName: string | null = null;
 	let sessionId: string | null = null;
@@ -259,7 +270,13 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		if (!Array.isArray(messages) || messages.length === 0) return null;
 		const maxId = Math.max(...messages.map((m: any) => m.event_id || 0));
 		if (maxId <= 0) return null;
-		return { messages: messages.filter((m: any) => !deliveredMessageIds.has(Number(m.event_id))), maxId };
+		return {
+			messages: messages.filter((m: any) =>
+				!deliveredMessageIds.has(Number(m.event_id))
+				&& !(m.intent !== "request" && isClosedSupervisionWorker(String(m.from))),
+			),
+			maxId,
+		};
 	}
 
 	async function deliverPending(ctx: ExtensionContext): Promise<boolean> {

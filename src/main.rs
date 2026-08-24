@@ -39,6 +39,7 @@ pub mod tools;
 pub mod transcript;
 mod tui;
 mod update;
+mod worker_sandbox;
 
 use anyhow::{Context, Result, bail};
 use std::panic;
@@ -160,17 +161,19 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         command = resolved;
         extra_args = vec![];
     }
-    let full_args: Vec<&str> = extra_args
-        .iter()
-        .map(|s| s.as_str())
-        .chain(tool_args.iter().copied())
+    let full_args: Vec<String> = extra_args
+        .into_iter()
+        .chain(tool_args.iter().map(|arg| (*arg).to_string()))
         .collect();
+    let worker = worker_sandbox::wrap_worker_command(command, full_args, instance_name.as_deref())?;
+    let worker_args: Vec<&str> = worker.args.iter().map(String::as_str).collect();
 
-    // Create and run PTY
+    // Create and run PTY. The proxy stays on the host; only the final tool
+    // process is wrapped when HCOM_WORKER_SANDBOX is enabled.
     let instance_name_for_failure = instance_name.clone();
     let mut proxy = match pty::Proxy::spawn(
-        &command,
-        &full_args,
+        &worker.command,
+        &worker_args,
         pty::ProxyConfig {
             ready_pattern,
             instance_name,

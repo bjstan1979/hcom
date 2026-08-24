@@ -380,6 +380,17 @@ where
         .filter(|(k, _)| !strip.contains(k.as_str()))
         .collect();
 
+    // Explicit worker sandbox selection belongs to the new worker, not to the
+    // parent agent identity. Preserve it even when a contaminated parent uses
+    // a clean login-shell environment as the launch baseline.
+    for key in ["HCOM_WORKER_SANDBOX", "HCOM_WORKER_SANDBOX_ROOT"] {
+        if let Ok(value) = std::env::var(key)
+            && !value.is_empty()
+        {
+            env.insert(key.to_string(), value);
+        }
+    }
+
     // HCOM_* settings from config.toml
     for (key, value) in hcom_config.to_env_dict() {
         if !value.is_empty() {
@@ -3046,6 +3057,32 @@ mod tests {
         assert_eq!(
             env.get("RORI_RESOLVED_AUTH").map(String::as_str),
             Some("auth-token")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_build_launch_env_preserves_explicit_worker_sandbox() {
+        let _guard = EnvVarGuard::remove(vec![
+            "HCOM_WORKER_SANDBOX".to_string(),
+            "HCOM_WORKER_SANDBOX_ROOT".to_string(),
+        ]);
+        unsafe { std::env::set_var("HCOM_WORKER_SANDBOX", "workspace") };
+        unsafe { std::env::set_var("HCOM_WORKER_SANDBOX_ROOT", "/repo") };
+
+        let config = crate::config::HcomConfig::default();
+        let env =
+            build_launch_env_with_resolver(&config, LaunchEnvRegime::ContaminatedParent, || {
+                Some(HashMap::new())
+            });
+
+        assert_eq!(
+            env.get("HCOM_WORKER_SANDBOX").map(String::as_str),
+            Some("workspace")
+        );
+        assert_eq!(
+            env.get("HCOM_WORKER_SANDBOX_ROOT").map(String::as_str),
+            Some("/repo")
         );
     }
 

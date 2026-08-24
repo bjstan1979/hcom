@@ -114,6 +114,30 @@ fn copy_private_file(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_private_settings(
+    source: &Path,
+    destination: &Path,
+    host_pi: &Path,
+    sandbox_pi: &Path,
+) -> Result<()> {
+    let contents = fs::read_to_string(source)
+        .with_context(|| format!("Failed to read Pi settings {}", source.display()))?;
+    let host_extensions = host_pi.join("extensions").to_string_lossy().into_owned();
+    let sandbox_extensions = sandbox_pi.join("extensions").to_string_lossy().into_owned();
+    let rewritten = contents.replace(&host_extensions, &sandbox_extensions);
+    if let Some(parent) = destination.parent() {
+        ensure_private_dir(parent)?;
+    }
+    fs::write(destination, rewritten).with_context(|| {
+        format!(
+            "Failed to write sandbox Pi settings {}",
+            destination.display()
+        )
+    })?;
+    crate::sys::fs::set_private(destination)?;
+    Ok(())
+}
+
 fn copy_private_tree(source: &Path, destination: &Path) -> Result<()> {
     ensure_private_dir(destination)?;
     for entry in fs::read_dir(source)
@@ -173,7 +197,12 @@ fn build_workspace_command(
     {
         let entry = entry?;
         if entry.file_type()?.is_file() && !entry.file_name().to_string_lossy().ends_with(".lock") {
-            copy_private_file(&entry.path(), &sandbox_pi.join(entry.file_name()))?;
+            let destination = sandbox_pi.join(entry.file_name());
+            if entry.file_name() == "settings.json" {
+                copy_private_settings(&entry.path(), &destination, &pi_agent, &sandbox_pi)?;
+            } else {
+                copy_private_file(&entry.path(), &destination)?;
+            }
         }
     }
     // Pi's package manager installs enabled packages into this directory.
@@ -181,6 +210,13 @@ fn build_workspace_command(
     let host_npm = pi_agent.join("npm");
     if host_npm.is_dir() {
         copy_private_tree(&host_npm, &sandbox_pi.join("npm"))?;
+    }
+    // Pi discovers user extensions relative to PI_CODING_AGENT_DIR. Expose
+    // the host extension tree at that private path read-only; do not copy it
+    // into the writable runtime, which would register duplicate tools.
+    let host_extensions = pi_agent.join("extensions");
+    if host_extensions.is_dir() {
+        ensure_private_dir(&sandbox_pi.join("extensions"))?;
     }
     let db = hcom_dir.join("hcom.db");
     let db_wal = hcom_dir.join("hcom.db-wal");
@@ -212,6 +248,11 @@ fn build_workspace_command(
     // worker's private runtime state as writable mounts.
     push_bind(&mut args, workspace, workspace);
     push_bind(&mut args, &sandbox_root, &sandbox_root);
+    if host_extensions.is_dir() {
+        args.push("--ro-bind".into());
+        args.push(host_extensions.to_string_lossy().into_owned());
+        args.push(sandbox_pi.join("extensions").to_string_lossy().into_owned());
+    }
     for (source, destination) in [
         (&db, sandbox_hcom.join("hcom.db")),
         (&db_wal, sandbox_hcom.join("hcom.db-wal")),
@@ -288,6 +329,20 @@ mod tests {
             w[0] == "--bind"
                 && w[1] == workspace.to_string_lossy()
                 && w[2] == workspace.to_string_lossy()
+        }));
+        assert!(wrapped.args.windows(3).any(|w| {
+            w == [
+                "--ro-bind",
+                dirs::home_dir()
+                    .unwrap()
+                    .join(".pi/agent/extensions")
+                    .to_string_lossy()
+                    .as_ref(),
+                hcom_dir
+                    .join("sandboxes/luna/pi-agent/extensions")
+                    .to_string_lossy()
+                    .as_ref(),
+            ]
         }));
         assert!(wrapped.args.windows(3).any(|w| {
             w == [

@@ -20,6 +20,7 @@ const PODMAN_STATE_ROOT_ENV: &str = "HCOM_PODMAN_STATE_ROOT";
 const PODMAN_PIDS_LIMIT_ENV: &str = "HCOM_PODMAN_PIDS_LIMIT";
 const PODMAN_MEMORY_ENV: &str = "HCOM_PODMAN_MEMORY";
 const PODMAN_CPUS_ENV: &str = "HCOM_PODMAN_CPUS";
+const AGENTMEMORY_SOCKET_ENV: &str = "AGENTMEMORY_SOCKET";
 const DEFAULT_PODMAN_IMAGE: &str = "localhost/hcom-pi-workspace:live";
 
 pub struct WorkerCommand {
@@ -289,6 +290,20 @@ fn build_podman_workspace_command(
             ] {
                 create.extend(["--volume".into(), mount]);
             }
+            if let Some(agentmemory_socket) =
+                env_nonempty(AGENTMEMORY_SOCKET_ENV).map(PathBuf::from)
+            {
+                if !agentmemory_socket.is_absolute() || !agentmemory_socket.exists() {
+                    bail!("AGENTMEMORY_SOCKET must be an existing absolute path");
+                }
+                let socket_parent = agentmemory_socket
+                    .parent()
+                    .context("agentmemory socket has no parent")?;
+                create.extend([
+                    "--volume".into(),
+                    bind_mount_arg(socket_parent, socket_parent, true),
+                ]);
+            }
             match (
                 env_nonempty("HCOM_BROKER_SOCKET").map(PathBuf::from),
                 env_nonempty("HCOM_BROKER_TOKEN_FILE").map(PathBuf::from),
@@ -371,6 +386,7 @@ fn build_podman_workspace_command(
         "HCOM_TAG",
         "HCOM_BROKER_SOCKET",
         "HCOM_BROKER_TOKEN_FILE",
+        AGENTMEMORY_SOCKET_ENV,
     ] {
         args.extend(["--env".into(), name.into()]);
     }

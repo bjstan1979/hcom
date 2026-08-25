@@ -393,6 +393,7 @@ where
         "HCOM_PODMAN_CPUS",
         "HCOM_BROKER_SOCKET",
         "HCOM_BROKER_TOKEN_FILE",
+        "AGENTMEMORY_SOCKET",
     ] {
         if let Ok(value) = std::env::var(key)
             && !value.is_empty()

@@ -219,12 +219,16 @@ fn build_workspace_command(
     if host_npm.is_dir() {
         copy_private_tree(&host_npm, &sandbox_pi.join("npm"))?;
     }
-    // Pi discovers user extensions relative to PI_CODING_AGENT_DIR. Expose
-    // the host extension tree at that private path read-only; do not copy it
-    // into the writable runtime, which would register duplicate tools.
+    // Pi discovers user extensions and custom agent definitions relative to
+    // PI_CODING_AGENT_DIR. Expose both host trees at their private paths
+    // read-only; do not copy them into the writable runtime, which would make
+    // policy-bearing agent definitions mutable from inside the worker.
     let host_extensions = pi_agent.join("extensions");
-    if host_extensions.is_dir() {
-        ensure_private_dir(&sandbox_pi.join("extensions"))?;
+    let host_agents = pi_agent.join("agents");
+    for (source, name) in [(&host_extensions, "extensions"), (&host_agents, "agents")] {
+        if source.is_dir() {
+            ensure_private_dir(&sandbox_pi.join(name))?;
+        }
     }
     let db = hcom_dir.join("hcom.db");
     let db_wal = hcom_dir.join("hcom.db-wal");
@@ -290,10 +294,12 @@ fn build_workspace_command(
     // worker's private runtime state as writable mounts.
     push_bind(&mut args, workspace, workspace);
     push_bind(&mut args, &sandbox_root, &sandbox_root);
-    if host_extensions.is_dir() {
-        args.push("--ro-bind".into());
-        args.push(host_extensions.to_string_lossy().into_owned());
-        args.push(sandbox_pi.join("extensions").to_string_lossy().into_owned());
+    for (source, name) in [(&host_extensions, "extensions"), (&host_agents, "agents")] {
+        if source.is_dir() {
+            args.push("--ro-bind".into());
+            args.push(source.to_string_lossy().into_owned());
+            args.push(sandbox_pi.join(name).to_string_lossy().into_owned());
+        }
     }
     for (source, destination) in [
         (&db, sandbox_hcom.join("hcom.db")),
@@ -373,20 +379,24 @@ mod tests {
                 && w[1] == workspace.to_string_lossy()
                 && w[2] == workspace.to_string_lossy()
         }));
-        assert!(wrapped.args.windows(3).any(|w| {
-            w == [
-                "--ro-bind",
-                dirs::home_dir()
-                    .unwrap()
-                    .join(".pi/agent/extensions")
-                    .to_string_lossy()
-                    .as_ref(),
-                hcom_dir
-                    .join("sandboxes/luna/pi-agent/extensions")
-                    .to_string_lossy()
-                    .as_ref(),
-            ]
-        }));
+        for name in ["extensions", "agents"] {
+            assert!(wrapped.args.windows(3).any(|w| {
+                w == [
+                    "--ro-bind",
+                    dirs::home_dir()
+                        .unwrap()
+                        .join(".pi/agent")
+                        .join(name)
+                        .to_string_lossy()
+                        .as_ref(),
+                    hcom_dir
+                        .join("sandboxes/luna/pi-agent")
+                        .join(name)
+                        .to_string_lossy()
+                        .as_ref(),
+                ]
+            }));
+        }
         assert!(
             wrapped
                 .args
@@ -455,6 +465,9 @@ printf sandbox > workspace.txt
 if printf escaped > "$1" 2>/dev/null; then exit 90; fi
 printf private > /tmp/private.txt
 test "$(cat /tmp/private.txt)" = private
+test -f "$PI_CODING_AGENT_DIR/agents/Explore.md"
+grep -q '^name: Explore$' "$PI_CODING_AGENT_DIR/agents/Explore.md"
+if printf tampered >> "$PI_CODING_AGENT_DIR/agents/Explore.md" 2>/dev/null; then exit 91; fi
 "#;
         let wrapped = build_workspace_command(
             bwrap,

@@ -468,6 +468,29 @@ mod tests {
     }
 
     #[test]
+    fn plugin_preserves_identity_across_in_process_session_replacement() {
+        assert!(
+            PLUGIN_SOURCE.contains("[\"reload\", \"new\", \"resume\", \"fork\"].includes(reason)")
+        );
+        assert!(PLUGIN_SOURCE.contains("if (instanceName && !replacingSession)"));
+        assert!(PLUGIN_SOURCE.contains("plugin.session_replacement"));
+        assert!(
+            PLUGIN_SOURCE.contains(
+                "await hcom([\"pi-stop\", \"--name\", instanceName, \"--reason\", reason])"
+            )
+        );
+    }
+
+    #[test]
+    fn plugin_cleans_reconcile_timer_between_session_runtimes() {
+        assert!(PLUGIN_SOURCE.contains("function stopReconcileTimer(): void"));
+        assert!(PLUGIN_SOURCE.contains("clearInterval(reconcileTimer)"));
+        assert!(
+            PLUGIN_SOURCE.contains("function resetBinding(): void {\n\t\tstopReconcileTimer();")
+        );
+    }
+
+    #[test]
     fn plugin_delivery_reports_active_edge() {
         assert!(PLUGIN_SOURCE.contains("reportStatus(ctx, \"active\""));
         assert!(PLUGIN_SOURCE.contains("`deliver:${sender}`"));

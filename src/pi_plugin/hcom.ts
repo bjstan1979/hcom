@@ -423,10 +423,19 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	}
 
 	function startReconcileTimer(): void {
-		if (!reconcileTimer) reconcileTimer = setInterval(() => void reconcile(), 5_000);
+		stopReconcileTimer();
+		reconcileTimer = setInterval(() => void reconcile(), 5_000);
+	}
+
+	function stopReconcileTimer(): void {
+		if (reconcileTimer) {
+			clearInterval(reconcileTimer);
+			reconcileTimer = null;
+		}
 	}
 
 	function resetBinding(): void {
+		stopReconcileTimer();
 		stopNotifyServer();
 		instanceName = null;
 		sessionId = null;
@@ -453,8 +462,15 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
-		if (instanceName) {
-			await hcom(["pi-stop", "--name", instanceName, "--reason", event.reason ?? "shutdown"]);
+		const reason = event.reason ?? "shutdown";
+		// Pi replaces the extension runtime in-process for reload/new/resume/fork,
+		// then emits session_start in a fresh runtime. The worker process and HCOM
+		// identity remain alive, so stopping here would leave a live pane marked ⊘.
+		const replacingSession = ["reload", "new", "resume", "fork"].includes(reason);
+		if (instanceName && !replacingSession) {
+			await hcom(["pi-stop", "--name", instanceName, "--reason", reason]);
+		} else if (instanceName) {
+			log("INFO", "plugin.session_replacement", instanceName, { reason });
 		}
 		resetBinding();
 	});

@@ -21,6 +21,7 @@ const PODMAN_PIDS_LIMIT_ENV: &str = "HCOM_PODMAN_PIDS_LIMIT";
 const PODMAN_MEMORY_ENV: &str = "HCOM_PODMAN_MEMORY";
 const PODMAN_CPUS_ENV: &str = "HCOM_PODMAN_CPUS";
 const AGENTMEMORY_SOCKET_ENV: &str = "AGENTMEMORY_SOCKET";
+const ANYSEARCH_SOCKET_ENV: &str = "ANYSEARCH_SOCKET";
 const DEFAULT_PODMAN_IMAGE: &str = "localhost/hcom-pi-workspace:live";
 
 pub struct WorkerCommand {
@@ -290,19 +291,14 @@ fn build_podman_workspace_command(
             ] {
                 create.extend(["--volume".into(), mount]);
             }
-            if let Some(agentmemory_socket) =
-                env_nonempty(AGENTMEMORY_SOCKET_ENV).map(PathBuf::from)
-            {
-                if !agentmemory_socket.is_absolute() || !agentmemory_socket.exists() {
-                    bail!("AGENTMEMORY_SOCKET must be an existing absolute path");
+            for env_name in [AGENTMEMORY_SOCKET_ENV, ANYSEARCH_SOCKET_ENV] {
+                if let Some(socket) = env_nonempty(env_name).map(PathBuf::from) {
+                    if !socket.is_absolute() || !socket.exists() {
+                        bail!("{env_name} must be an existing absolute path");
+                    }
+                    let parent = socket.parent().context("bridge socket has no parent")?;
+                    create.extend(["--volume".into(), bind_mount_arg(parent, parent, true)]);
                 }
-                let socket_parent = agentmemory_socket
-                    .parent()
-                    .context("agentmemory socket has no parent")?;
-                create.extend([
-                    "--volume".into(),
-                    bind_mount_arg(socket_parent, socket_parent, true),
-                ]);
             }
             match (
                 env_nonempty("HCOM_BROKER_SOCKET").map(PathBuf::from),
@@ -387,6 +383,7 @@ fn build_podman_workspace_command(
         "HCOM_BROKER_SOCKET",
         "HCOM_BROKER_TOKEN_FILE",
         AGENTMEMORY_SOCKET_ENV,
+        ANYSEARCH_SOCKET_ENV,
     ] {
         args.extend(["--env".into(), name.into()]);
     }

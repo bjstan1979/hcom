@@ -123,10 +123,10 @@ export HCOM_WORKER_SANDBOX_ROOT=$workspace
 export HCOM_PODMAN_IMAGE=$image
 export HCOM_BROKER_SOCKET=$socket
 export HCOM_BROKER_TOKEN_FILE=$token
-agentmemory_socket=${AGENTMEMORY_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/agentmemory-bridge/agentmemory.sock}
-if [[ -S "$agentmemory_socket" ]]; then
-  export AGENTMEMORY_SOCKET=$agentmemory_socket
-else
-  unset AGENTMEMORY_SOCKET
-fi
+for bridge in AGENTMEMORY ANYSEARCH; do
+  var=${bridge}_SOCKET
+  default=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${bridge,,}-bridge/${bridge,,}.sock
+  socket=${!var:-$default}
+  if [[ -S "$socket" ]]; then export "$var=$socket"; else unset "$var"; fi
+done
 exec hcom "${args[@]}"

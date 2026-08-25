@@ -107,7 +107,9 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	const PENDING_POLL_MS = 60_000;
 	const FALLBACK_PENDING_POLL_MS = 5_000;
-	const LISTENING_HEARTBEAT_MS = 20_000;
+	// Broker-backed plugin delivery has no host-reachable TCP endpoint, so its
+	// heartbeat must stay below HCOM's 10s no-TCP stale threshold.
+	const LISTENING_HEARTBEAT_MS = 5_000;
 	const IDLE_DEBOUNCE_MS = 250;
 
 	function statusKey(status: string, context: string, detail: string): string {
@@ -311,10 +313,15 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			const formatted = formatMessagesForInjection(pending.messages, instanceName);
 			pendingAckId = pending.maxId;
 			try {
+				// sendUserMessage is the sole model input. In RPC mode Pi does not emit
+				// externally injected user messages as ACP updates, so mirror the text
+				// through the existing notification bridge for Happy/mobile visibility.
+				// This is display-only and does not create a second delivery channel.
+				if (ctx.mode === "rpc") ctx.ui.notify(formatted);
 				if (ctx.isIdle()) {
-					pi.sendUserMessage(formatted);
+					await pi.sendUserMessage(formatted);
 				} else {
-					pi.sendUserMessage(formatted, { deliverAs: "followUp" });
+					await pi.sendUserMessage(formatted, { deliverAs: "followUp" });
 				}
 				// Pi accepted the injection; persist before status/ack subprocesses so
 				// reload cannot reopen a duplicate-delivery window.

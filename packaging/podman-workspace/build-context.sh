@@ -54,6 +54,13 @@ for entry in settings.json APPEND_SYSTEM.md schedule-prompts-settings.json; do
     cp --no-preserve=ownership "$seed/$entry" "$runtime/$entry"
   fi
 done
+# HCOM owns this integration extension. Refresh it from the image on every
+# container start so persistent workspace state receives security/delivery
+# fixes without replacing any user-managed extensions or settings.
+if [ -f "$seed/extensions/hcom.ts" ]; then
+  mkdir -p "$runtime/extensions"
+  cp --no-preserve=ownership "$seed/extensions/hcom.ts" "$runtime/extensions/hcom.ts"
+fi
 exec /usr/local/bin/pi "$@"
 EOF
 chmod 0755 "$out/rootfs/usr/local/bin/pi" "$out/rootfs/usr/local/bin/pi-container-entry"

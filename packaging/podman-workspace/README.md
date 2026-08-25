@@ -15,7 +15,10 @@ resolve outside the Pi directory are materialized with their production
 dependency closure. Git metadata is removed. Override `HCOM_BIN`,
 `PI_PACKAGE_DIR`, or `PI_CODING_AGENT_DIR` when the live installation is
 elsewhere. Credentials, sessions, HCOM state, and mutable runtime state are not
-baked into the image.
+baked into the image. Workspace state is seeded once, except the HCOM-owned
+`extensions/hcom.ts`, which is refreshed from the image on every Pi start so a
+rebuilt image can deliver integration and security fixes without overwriting
+other extensions or user settings.
 
 Install the launchers and run:
 

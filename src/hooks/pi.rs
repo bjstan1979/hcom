@@ -459,7 +459,8 @@ mod tests {
         ));
         assert!(PLUGIN_SOURCE.contains("pi.on(\"agent_end\""));
         assert!(PLUGIN_SOURCE.contains("IDLE_DEBOUNCE_MS"));
-        assert!(PLUGIN_SOURCE.contains("LISTENING_HEARTBEAT_MS = 20_000"));
+        assert!(PLUGIN_SOURCE.contains("LISTENING_HEARTBEAT_MS = 5_000"));
+        assert!(PLUGIN_SOURCE.contains("10s no-TCP stale threshold"));
         assert!(PLUGIN_SOURCE.contains("lastListeningHeartbeatAt"));
         assert!(PLUGIN_SOURCE.contains("heartbeatDue"));
         assert!(PLUGIN_SOURCE.contains("currentCtx?.isIdle()"));
@@ -470,6 +471,22 @@ mod tests {
     fn plugin_delivery_reports_active_edge() {
         assert!(PLUGIN_SOURCE.contains("reportStatus(ctx, \"active\""));
         assert!(PLUGIN_SOURCE.contains("`deliver:${sender}`"));
+    }
+
+    #[test]
+    fn plugin_mirrors_rpc_delivery_for_acp_visibility_only() {
+        assert!(PLUGIN_SOURCE.contains("if (ctx.mode === \"rpc\") ctx.ui.notify(formatted)"));
+        assert_eq!(
+            PLUGIN_SOURCE.matches("ctx.ui.notify(formatted)").count(),
+            1,
+            "RPC visibility mirror must remain a single display-only notification"
+        );
+        assert!(PLUGIN_SOURCE.contains("sendUserMessage is the sole model input"));
+        assert!(PLUGIN_SOURCE.contains("await pi.sendUserMessage(formatted)"));
+        assert!(
+            PLUGIN_SOURCE
+                .contains("await pi.sendUserMessage(formatted, { deliverAs: \"followUp\" })")
+        );
     }
 
     #[test]

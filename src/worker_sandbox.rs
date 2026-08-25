@@ -35,6 +35,30 @@ pub fn wrap_worker_command(
     args: Vec<String>,
     instance_name: Option<&str>,
 ) -> Result<WorkerCommand> {
+    if std::env::var("HCOM_HAPPY_HOST_RUNNER").as_deref() == Ok("1") {
+        let expected = std::env::var("HCOM_PI_BIN").unwrap_or_default();
+        let command_path = Path::new(&command).canonicalize().ok();
+        let expected_path = Path::new(&expected).canonicalize().ok();
+        if !expected.is_empty() && command_path.is_some() && command_path == expected_path {
+            return Ok(WorkerCommand {
+                command,
+                args,
+                _flock_helper: None,
+            });
+        }
+        // A stale/foreign Happy override must never become a host bypass. Fall
+        // through to the ordinary sandbox path; this also keeps independent
+        // launches safe when process-wide test/config environments overlap.
+    }
+    wrap_worker_command_with_stdio(command, args, instance_name, true)
+}
+
+fn wrap_worker_command_with_stdio(
+    command: String,
+    args: Vec<String>,
+    instance_name: Option<&str>,
+    terminal: bool,
+) -> Result<WorkerCommand> {
     let mode = std::env::var(MODE_ENV).unwrap_or_default();
     if mode.is_empty() || mode == "off" {
         return Ok(WorkerCommand {
@@ -83,7 +107,7 @@ pub fn wrap_worker_command(
     }
 
     if mode == PODMAN_WORKSPACE_MODE {
-        return build_podman_workspace_command(command, args, &workspace);
+        return build_podman_workspace_command(command, args, &workspace, terminal);
     }
 
     let instance = instance_name
@@ -164,6 +188,7 @@ fn build_podman_workspace_command(
     worker_command: String,
     worker_args: Vec<String>,
     workspace: &Path,
+    terminal: bool,
 ) -> Result<WorkerCommand> {
     if unsafe { libc::geteuid() } == 0 {
         bail!("Refusing to run Podman workspace sandbox as root");
@@ -317,10 +342,11 @@ fn build_podman_workspace_command(
         Some("hcom") => "/usr/local/bin/hcom".to_string(),
         _ => worker_command,
     };
-    let mut args = vec![
-        "exec".into(),
-        "--interactive".into(),
-        "--tty".into(),
+    let mut args = vec!["exec".into(), "--interactive".into()];
+    if terminal {
+        args.push("--tty".into());
+    }
+    args.extend([
         "--workdir".into(),
         workspace.to_string_lossy().into_owned(),
         "--env".into(),
@@ -338,7 +364,7 @@ fn build_podman_workspace_command(
         format!("{MODE_ENV}={PODMAN_WORKSPACE_MODE}"),
         "--env".into(),
         format!("{ROOT_ENV}={}", workspace.to_string_lossy()),
-    ];
+    ]);
     for name in [
         "HCOM_PROCESS_ID",
         "HCOM_LAUNCHED",
@@ -355,6 +381,65 @@ fn build_podman_workspace_command(
         args,
         _flock_helper: None,
     })
+}
+
+pub fn run_sandbox_pi_rpc(args: &[String]) -> Result<i32> {
+    validate_pi_rpc_environment()?;
+    validate_pi_rpc_args(args)?;
+    let worker = wrap_worker_command_with_stdio("pi".into(), args.to_vec(), None, false)?;
+    let status = Command::new(&worker.command)
+        .args(&worker.args)
+        .status()
+        .with_context(|| format!("Failed to execute sandboxed Pi RPC: {}", worker.command))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn validate_pi_rpc_environment() -> Result<()> {
+    if std::env::var("HCOM_LAUNCHED").as_deref() != Ok("1")
+        || env_nonempty("HCOM_PROCESS_ID").is_none()
+    {
+        bail!("sandbox-pi-rpc requires a managed HCOM launch");
+    }
+    if std::env::var(MODE_ENV).as_deref() != Ok(PODMAN_WORKSPACE_MODE) {
+        bail!("sandbox-pi-rpc requires podman-workspace mode");
+    }
+    if env_nonempty(ROOT_ENV).is_none() {
+        bail!("sandbox-pi-rpc requires an explicit workspace root");
+    }
+    if env_nonempty("HCOM_BROKER_SOCKET").is_none()
+        || env_nonempty("HCOM_BROKER_TOKEN_FILE").is_none()
+    {
+        bail!("sandbox-pi-rpc requires the authenticated workspace broker");
+    }
+    Ok(())
+}
+
+fn validate_pi_rpc_args(args: &[String]) -> Result<()> {
+    let mut mode_rpc = false;
+    let mut no_themes = false;
+    let mut session = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--mode" if args.get(i + 1).map(String::as_str) == Some("rpc") && !mode_rpc => {
+                mode_rpc = true;
+                i += 2;
+            }
+            "--no-themes" if !no_themes => {
+                no_themes = true;
+                i += 1;
+            }
+            "--session" if !session && args.get(i + 1).is_some_and(|v| !v.is_empty()) => {
+                session = true;
+                i += 2;
+            }
+            arg => bail!("unsupported sandbox Pi RPC argument: {arg}"),
+        }
+    }
+    if !mode_rpc {
+        bail!("sandbox Pi RPC requires --mode rpc");
+    }
+    Ok(())
 }
 
 fn seed_workspace_pi_credentials(pi_state: &Path) -> Result<()> {
@@ -829,6 +914,17 @@ exit 45
                 .iter()
                 .any(|arg| arg == "/usr/local/bin/pi-container-entry")
         );
+        let rpc = build_podman_workspace_command(
+            "pi".into(),
+            vec!["--mode".into(), "rpc".into(), "--no-themes".into()],
+            &workspace_a.canonicalize().unwrap(),
+            false,
+        )
+        .unwrap();
+        assert!(rpc.args.iter().any(|arg| arg == "--interactive"));
+        assert!(!rpc.args.iter().any(|arg| arg == "--tty"));
+        assert!(rpc.args.iter().any(|arg| arg == "--mode"));
+        assert!(rpc.args.iter().any(|arg| arg == "rpc"));
         assert!(
             first
                 .args
@@ -959,7 +1055,7 @@ exit 45
         ]);
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&workspace).unwrap();
-        let error = match build_podman_workspace_command("pi".into(), vec![], &workspace) {
+        let error = match build_podman_workspace_command("pi".into(), vec![], &workspace, true) {
             Ok(_) => panic!("non-rootless Podman unexpectedly accepted"),
             Err(error) => error,
         };
@@ -1227,6 +1323,101 @@ cat "$2/other.jsonl" >/dev/null
         );
         assert_eq!(fs::read_to_string(&other).unwrap(), "other\n");
         assert!(!other_sessions.join("new.jsonl").exists());
+    }
+
+    #[test]
+    fn sandbox_pi_rpc_environment_is_fail_closed() {
+        let _guard = EnvGuard::new();
+        let vars = [
+            ("HCOM_LAUNCHED", Some(std::ffi::OsStr::new("1"))),
+            ("HCOM_PROCESS_ID", Some(std::ffi::OsStr::new("process-id"))),
+            (MODE_ENV, Some(std::ffi::OsStr::new(PODMAN_WORKSPACE_MODE))),
+            (ROOT_ENV, Some(std::ffi::OsStr::new("/workspace"))),
+            (
+                "HCOM_BROKER_SOCKET",
+                Some(std::ffi::OsStr::new("/broker/socket")),
+            ),
+            (
+                "HCOM_BROKER_TOKEN_FILE",
+                Some(std::ffi::OsStr::new("/broker/token")),
+            ),
+        ];
+        let _vars = VarGuard::set(&vars);
+        assert!(validate_pi_rpc_environment().is_ok());
+        unsafe { std::env::set_var(MODE_ENV, "off") };
+        assert!(
+            validate_pi_rpc_environment()
+                .unwrap_err()
+                .to_string()
+                .contains("podman-workspace")
+        );
+        unsafe { std::env::set_var(MODE_ENV, PODMAN_WORKSPACE_MODE) };
+        unsafe { std::env::remove_var("HCOM_BROKER_TOKEN_FILE") };
+        assert!(
+            validate_pi_rpc_environment()
+                .unwrap_err()
+                .to_string()
+                .contains("authenticated workspace broker")
+        );
+    }
+
+    #[test]
+    fn sandbox_pi_rpc_arguments_are_fail_closed() {
+        assert!(validate_pi_rpc_args(&["--mode".into(), "rpc".into()]).is_ok());
+        assert!(
+            validate_pi_rpc_args(&[
+                "--mode".into(),
+                "rpc".into(),
+                "--no-themes".into(),
+                "--session".into(),
+                "01a0387b-6ec0-7421-afd1-4fe665227c50".into(),
+            ])
+            .is_ok()
+        );
+        assert!(validate_pi_rpc_args(&["--no-themes".into()]).is_err());
+        assert!(
+            validate_pi_rpc_args(&[
+                "--mode".into(),
+                "rpc".into(),
+                "--model".into(),
+                "unsafe".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_pi_rpc_args(&[
+                "--mode".into(),
+                "rpc".into(),
+                "--session".into(),
+                "one".into(),
+                "--session".into(),
+                "two".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn happy_host_runner_must_match_pi_override() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let runner = temp.path().join("hcom-happy-pi");
+        fs::write(&runner, "#!/bin/sh\n").unwrap();
+        let vars = [
+            ("HCOM_HAPPY_HOST_RUNNER", Some(std::ffi::OsStr::new("1"))),
+            ("HCOM_PI_BIN", Some(runner.as_os_str())),
+        ];
+        let _vars = VarGuard::set(&vars);
+        let worker = wrap_worker_command(
+            runner.to_string_lossy().into_owned(),
+            vec!["--session".into(), "session-id".into()],
+            Some("happy"),
+        )
+        .unwrap();
+        assert_eq!(worker.command, runner.to_string_lossy());
+        let mismatch = wrap_worker_command("/bin/sh".into(), vec![], Some("happy")).unwrap();
+        assert_eq!(mismatch.command, "/bin/sh");
+        assert_ne!(mismatch.command, worker.command);
     }
 
     #[test]

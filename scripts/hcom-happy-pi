@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+session=
+while (($#)); do
+  case "$1" in
+    --session) (($# >= 2)) || { echo 'hcom-happy-pi: --session requires a value' >&2; exit 2; }; session=$2; shift 2 ;;
+    --session=*) session=${1#*=}; shift ;;
+    *) printf 'hcom-happy-pi: unsupported Pi argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
+
+for command in happy pi-acp hcom-happy-pi-rpc; do
+  command -v "$command" >/dev/null 2>&1 || { printf 'hcom-happy-pi: required command missing: %s\n' "$command" >&2; exit 1; }
+done
+[[ ${HCOM_LAUNCHED:-} == 1 && -n ${HCOM_PROCESS_ID:-} ]] || {
+  echo 'hcom-happy-pi: must be started by hcom-happy-sandbox' >&2
+  exit 1
+}
+
+export PI_ACP_PI_COMMAND
+PI_ACP_PI_COMMAND=$(command -v hcom-happy-pi-rpc)
+if [[ -n "$session" ]]; then
+  export HCOM_HAPPY_PI_SESSION=$session
+else
+  unset HCOM_HAPPY_PI_SESSION
+fi
+# Happy's ACP path is the host-side encrypted mobile transport; it directly
+# spawns pi-acp and does not engage Happy's Claude/Codex sandbox manager. The Pi
+# process itself is constrained by HCOM's persistent rootless Podman workspace.
+exec happy acp -- pi-acp

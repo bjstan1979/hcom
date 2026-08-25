@@ -1700,8 +1700,15 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         );
     }
 
-    let tool_binary = normalized.cli_binary();
-    if !is_tool_installed(tool_binary) {
+    let tool_binary = if matches!(normalized, LaunchTool::Pi) {
+        std::env::var("HCOM_PI_BIN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| normalized.cli_binary().to_string())
+    } else {
+        normalized.cli_binary().to_string()
+    };
+    if !is_tool_installed(&tool_binary) {
         bail!("'{}' is not installed or not in PATH", tool_binary);
     }
 

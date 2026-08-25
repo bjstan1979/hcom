@@ -48,6 +48,9 @@ use std::str::FromStr;
 
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("sandbox-pi-rpc") {
+        std::process::exit(worker_sandbox::run_sandbox_pi_rpc(&argv[1..])?);
+    }
     if broker::maybe_serve(&argv)? {
         return Ok(());
     }
@@ -148,21 +151,30 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     // Resolve tool to full path (PATH may be minimal in launched environments)
     let tool_exe = tool_str
         .parse::<tool::Tool>()
-        .map(|t| t.spec().cli_binary)
-        .unwrap_or(tool_str);
-    let resolved = terminal::which_bin(tool_exe).unwrap_or_else(|| tool_exe.to_string());
+        .map(|t| {
+            if t == tool::Tool::Pi {
+                std::env::var("HCOM_PI_BIN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| t.spec().cli_binary.to_string())
+            } else {
+                t.spec().cli_binary.to_string()
+            }
+        })
+        .unwrap_or_else(|_| tool_str.to_string());
+    let resolved = terminal::which_bin(&tool_exe).unwrap_or_else(|| tool_exe.clone());
 
     // On Termux, some wrapped tools need a launcher override instead of direct exec.
     let (command, extra_args): (String, Vec<String>);
     #[cfg(windows)]
-    let windows_launcher = terminal::resolve_windows_tool_launcher(tool_exe, &resolved);
+    let windows_launcher = terminal::resolve_windows_tool_launcher(&tool_exe, &resolved);
     #[cfg(not(windows))]
     let windows_launcher: Option<(String, Vec<String>)> = None;
     if let Some((launcher, prefix_args)) = windows_launcher {
         command = launcher;
         extra_args = prefix_args;
     } else if let Some((launcher, prefix_args)) =
-        terminal::resolve_termux_tool_launcher(tool_exe, &resolved)
+        terminal::resolve_termux_tool_launcher(&tool_exe, &resolved)
     {
         command = launcher;
         extra_args = prefix_args;

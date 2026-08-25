@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: hcom-happy-sandbox [--workspace DIR] [--session ID] [--tag TAG]
+
+Start Happy on the host with its pi-acp backend driving the same HCOM-managed
+Pi session inside the persistent Podman workspace sandbox.
+
+Options:
+  --workspace DIR  Project workspace (default: current directory)
+  --session ID     Open an existing Pi session UUID/path
+  --tag TAG        Optional HCOM agent tag
+EOF
+}
+
+workspace=$PWD
+session=
+tag=
+while (($#)); do
+  case "$1" in
+    --workspace) (($# >= 2)) || { echo 'hcom-happy-sandbox: --workspace requires a value' >&2; exit 2; }; workspace=$2; shift 2 ;;
+    --workspace=*) workspace=${1#*=}; shift ;;
+    --session) (($# >= 2)) || { echo 'hcom-happy-sandbox: --session requires a value' >&2; exit 2; }; session=$2; shift 2 ;;
+    --session=*) session=${1#*=}; shift ;;
+    --tag) (($# >= 2)) || { echo 'hcom-happy-sandbox: --tag requires a value' >&2; exit 2; }; tag=$2; shift 2 ;;
+    --tag=*) tag=${1#*=}; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'hcom-happy-sandbox: unsupported argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+for command in hcom-podman-sandbox hcom-happy-pi hcom-happy-pi-rpc happy pi-acp; do
+  command -v "$command" >/dev/null 2>&1 || { printf 'hcom-happy-sandbox: required command missing: %s\n' "$command" >&2; exit 1; }
+done
+[[ -d "$workspace" ]] || { printf 'hcom-happy-sandbox: workspace is not a directory: %s\n' "$workspace" >&2; exit 1; }
+workspace=$(realpath -e -- "$workspace")
+
+export HCOM_PI_BIN
+HCOM_PI_BIN=$(command -v hcom-happy-pi)
+export HCOM_HAPPY_HOST_RUNNER=1
+export HCOM_PLUGIN_ONLY_DELIVERY=1
+args=(1 pi)
+[[ -z "$session" ]] || args+=(--session "$session")
+[[ -z "$tag" ]] || args+=(--tag "$tag")
+exec hcom-podman-sandbox --workspace "$workspace" "${args[@]}"

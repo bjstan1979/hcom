@@ -22,6 +22,8 @@ Install the launchers and run:
 ```sh
 install -m 0755 scripts/hcom-podman-sandbox ~/.local/bin/
 install -m 0755 scripts/hcom-sandbox ~/.local/bin/
+install -m 0755 scripts/hcom-happy-sandbox scripts/hcom-happy-pi \
+  scripts/hcom-happy-pi-rpc ~/.local/bin/
 hcom-sandbox --workspace /path/to/project 1 pi
 ```
 
@@ -32,6 +34,27 @@ persistent container per canonical workspace, seeds workspace-private
 broker service. Host HCOM DB/key are never mounted. Rootless namespace uid 0
 maps to the launching host user; all capabilities are dropped, no-new-privileges
 is set, and the root filesystem is read-only.
+
+## Happy mobile + HCOM
+
+Keep Happy and `pi-acp` on the host while the Pi RPC process runs in the same
+Podman workspace sandbox and binds to HCOM through the Pi extension:
+
+```sh
+hcom-happy-sandbox --workspace /path/to/project
+hcom-happy-sandbox --workspace /path/to/project \
+  --session 01a0387b-6ec0-7421-afd1-4fe665227c50
+```
+
+The second form opens the requested existing Pi session in Happy. It is distinct
+from `happy resume <happy-session-id>`: `--session` selects the Pi transcript
+and lets HCOM restore that transcript's canonical identity. Do not concurrently
+open the same Pi session through both the interactive TUI and Happy. Happy's ACP path stays on the host
+as the encrypted mobile transport and does not engage its Claude/Codex sandbox
+manager; the Pi process remains inside the rootless, capability-free,
+read-only-rootfs HCOM Podman sandbox. HCOM delivery is plugin-only in this mode,
+so messages are sent
+to the same Pi RPC session rather than injected into Happy's host terminal.
 
 Optional runtime settings: `HCOM_PODMAN_IMAGE`, `HCOM_PODMAN_STATE_ROOT`,
 `HCOM_PODMAN_PIDS_LIMIT`, `HCOM_PODMAN_MEMORY`, and `HCOM_PODMAN_CPUS`.

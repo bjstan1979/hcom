@@ -321,6 +321,14 @@ pub(super) fn start_delivery_thread(
     current_status: Arc<RwLock<String>>,
     title_wake: Option<crate::delivery::TitleWake>,
 ) -> Result<DeliveryStart> {
+    if std::env::var("HCOM_PLUGIN_ONLY_DELIVERY").as_deref() == Ok("1") {
+        crate::log::log_info(
+            "native",
+            "delivery.skip.plugin_only",
+            "PTY delivery disabled; the managed Pi plugin is the sole delivery channel",
+        );
+        return Ok(DeliveryStart::Disabled);
+    }
     let instance_name = match instance_name_cfg {
         Some(name) => name.to_string(),
         None => {
@@ -1009,7 +1017,28 @@ fn advance_pending_utf8(mut pending: u8, data: &[u8]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::EnvGuard;
     use crate::shared::status_icon;
+
+    #[test]
+    fn plugin_only_mode_disables_pty_delivery() {
+        let _guard = EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_PLUGIN_ONLY_DELIVERY", "1") };
+        let result = start_delivery_thread(
+            Some("happy-pi"),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(RwLock::new(ScreenState::default())),
+            Arc::new(AtomicBool::new(true)),
+            1,
+            PtyTarget::Known(Tool::Pi),
+            Arc::new(AtomicU16::new(0)),
+            Arc::new(RwLock::new(String::new())),
+            Arc::new(RwLock::new(String::new())),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(result, DeliveryStart::Disabled));
+    }
 
     #[test]
     fn should_start_delivery_on_ready() {

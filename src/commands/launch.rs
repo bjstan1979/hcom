@@ -227,7 +227,13 @@ pub(crate) fn prepare_launch_execution(
     config: &HcomConfig,
     headless: bool,
 ) -> (Vec<String>, bool) {
-    let mut merged_args = merge_tool_args(tool, cli_args, config);
+    let mut merged_args = if matches!(tool, LaunchTool::Pi)
+        && std::env::var("HCOM_HAPPY_HOST_RUNNER").as_deref() == Ok("1")
+    {
+        cli_args.to_vec()
+    } else {
+        merge_tool_args(tool, cli_args, config)
+    };
     let background = headless || is_background_from_args(tool, &merged_args);
 
     // Print mode needs stream-json for the stop-hook loop. Keep this deliberately
@@ -863,6 +869,7 @@ fn format_inline_launch_readiness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::EnvGuard;
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|i| i.to_string()).collect()
@@ -1082,6 +1089,20 @@ mod tests {
             parse_launch_argv(&s(&["claude", "--device", "ABCD", "--model", "haiku"])).unwrap();
         assert_eq!(flags.device, Some("ABCD".to_string()));
         assert_eq!(args, s(&["--model", "haiku"]));
+    }
+
+    #[test]
+    fn test_happy_pi_launch_ignores_regular_pi_config_args() {
+        let _guard = EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_HAPPY_HOST_RUNNER", "1") };
+        let mut config = HcomConfig::default();
+        config
+            .set_field("pi_args", "--model configured-model")
+            .unwrap();
+        let (args, background) =
+            prepare_launch_execution(&lt("pi"), &s(&["--session", "session-id"]), &config, false);
+        assert_eq!(args, s(&["--session", "session-id"]));
+        assert!(!background);
     }
 
     #[test]

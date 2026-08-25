@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ ${HCOM_LAUNCHED:-} == 1 && -n ${HCOM_PROCESS_ID:-} ]] || {
+  echo 'hcom-happy-pi-rpc: managed HCOM launch identity is required' >&2
+  exit 1
+}
+
+args=("$@")
+has_session=false
+for ((i=0; i<${#args[@]}; i++)); do
+  if [[ ${args[$i]} == --session || ${args[$i]} == --session=* ]]; then
+    has_session=true
+    break
+  fi
+done
+if [[ $has_session == false && -n ${HCOM_HAPPY_PI_SESSION:-} ]]; then
+  args+=(--session "$HCOM_HAPPY_PI_SESSION")
+fi
+exec hcom sandbox-pi-rpc "${args[@]}"

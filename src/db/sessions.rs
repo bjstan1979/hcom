@@ -1,7 +1,7 @@
 //! Session and process binding helpers.
 
 use anyhow::{Result, bail};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::HcomDb;
 use crate::shared::time::now_epoch_f64;
@@ -397,7 +397,11 @@ impl HcomDb {
             bail!("session_id and instance_name are required for atomic binding");
         }
 
-        let tx = self.conn.unchecked_transaction()?;
+        // Acquire the write reservation before reading. A deferred transaction
+        // can read the target, lose the WAL snapshot to another writer, then
+        // fail immediately with SQLITE_BUSY_SNAPSHOT when it upgrades to a
+        // write transaction (busy_timeout does not repair that upgrade race).
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let target_exists = tx
             .query_row(
                 "SELECT 1 FROM instances WHERE name = ? LIMIT 1",
@@ -747,7 +751,7 @@ impl HcomDb {
 mod tests {
     use super::super::HcomDb;
     use super::super::tests::{cleanup_test_db, setup_full_test_db};
-    use rusqlite::params;
+    use rusqlite::{Transaction, TransactionBehavior, params};
     use serial_test::serial;
 
     fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
@@ -945,6 +949,40 @@ mod tests {
         assert_eq!(
             db.get_instance_full("nova").unwrap().unwrap().session_id,
             None
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_bind_session_process_atomic_waits_for_concurrent_writer() {
+        use std::time::{Duration, Instant};
+
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let blocker = Transaction::new_unchecked(&db.conn, TransactionBehavior::Immediate).unwrap();
+        let path = db_path.clone();
+        let waiter = std::thread::spawn(move || {
+            let waiting_db = HcomDb::open_raw(&path).unwrap();
+            let started = Instant::now();
+            waiting_db
+                .bind_session_process_atomic("sess-new", "luna", Some("pid-current"))
+                .unwrap();
+            started.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        blocker.commit().unwrap();
+        let elapsed = waiter.join().unwrap();
+        assert!(elapsed >= Duration::from_millis(75), "elapsed={elapsed:?}");
+        assert_eq!(
+            db.get_session_binding("sess-new").unwrap().as_deref(),
+            Some("luna")
         );
 
         cleanup_test_db(db_path);

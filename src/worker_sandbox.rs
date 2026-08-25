@@ -5,13 +5,22 @@
 //! not need broad writable access inside the sandbox.
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 const MODE_ENV: &str = "HCOM_WORKER_SANDBOX";
 const ROOT_ENV: &str = "HCOM_WORKER_SANDBOX_ROOT";
 const WORKSPACE_MODE: &str = "workspace";
+const PODMAN_WORKSPACE_MODE: &str = "podman-workspace";
+const PODMAN_IMAGE_ENV: &str = "HCOM_PODMAN_IMAGE";
+const PODMAN_STATE_ROOT_ENV: &str = "HCOM_PODMAN_STATE_ROOT";
+const PODMAN_PIDS_LIMIT_ENV: &str = "HCOM_PODMAN_PIDS_LIMIT";
+const PODMAN_MEMORY_ENV: &str = "HCOM_PODMAN_MEMORY";
+const PODMAN_CPUS_ENV: &str = "HCOM_PODMAN_CPUS";
+const DEFAULT_PODMAN_IMAGE: &str = "localhost/hcom-pi-workspace:live";
 
 pub struct WorkerCommand {
     pub command: String,
@@ -34,11 +43,11 @@ pub fn wrap_worker_command(
             _flock_helper: None,
         });
     }
-    if mode != WORKSPACE_MODE {
+    if mode != WORKSPACE_MODE && mode != PODMAN_WORKSPACE_MODE {
         bail!("Unsupported HCOM worker sandbox mode: {mode}");
     }
     if !cfg!(target_os = "linux") {
-        bail!("HCOM worker sandbox requires Linux bubblewrap");
+        bail!("HCOM worker sandbox requires Linux");
     }
 
     let workspace = match std::env::var(ROOT_ENV) {
@@ -73,6 +82,10 @@ pub fn wrap_worker_command(
         );
     }
 
+    if mode == PODMAN_WORKSPACE_MODE {
+        return build_podman_workspace_command(command, args, &workspace);
+    }
+
     let instance = instance_name
         .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow::anyhow!("Sandbox worker requires an HCOM instance name"))?;
@@ -80,6 +93,278 @@ pub fn wrap_worker_command(
         .ok_or_else(|| anyhow::anyhow!("bubblewrap (bwrap) is required for sandbox workers"))?;
 
     build_workspace_command(bwrap, command, args, &workspace, &hcom_dir, instance)
+}
+
+fn podman_output(podman: &str, args: &[String]) -> Result<Output> {
+    Command::new(podman)
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to execute rootless Podman: {podman}"))
+}
+
+fn podman_success(podman: &str, args: &[String], action: &str) -> Result<Output> {
+    let output = podman_output(podman, args)?;
+    if !output.status.success() {
+        bail!(
+            "Podman {action} failed (status {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output)
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn workspace_id(workspace: &Path) -> String {
+    let digest = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
+    digest[..10]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn bind_mount_arg(source: &Path, destination: &Path, read_only: bool) -> String {
+    format!(
+        "{}:{}:{}",
+        source.to_string_lossy(),
+        destination.to_string_lossy(),
+        if read_only { "ro" } else { "rw" }
+    )
+}
+
+fn inspect_value(podman: &str, container: &str, format: &str) -> Result<String> {
+    let args = vec![
+        "container".into(),
+        "inspect".into(),
+        "--format".into(),
+        format.into(),
+        container.into(),
+    ];
+    let output = podman_success(podman, &args, "container inspection")?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn lock_file(file: &File) -> Result<()> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        bail!(
+            "Failed to lock Podman workspace state: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+fn build_podman_workspace_command(
+    worker_command: String,
+    worker_args: Vec<String>,
+    workspace: &Path,
+) -> Result<WorkerCommand> {
+    if unsafe { libc::geteuid() } == 0 {
+        bail!("Refusing to run Podman workspace sandbox as root");
+    }
+    let podman = crate::terminal::which_bin("podman")
+        .ok_or_else(|| anyhow::anyhow!("podman is required for podman-workspace workers"))?;
+    let info_args = vec![
+        "info".into(),
+        "--format".into(),
+        "{{.Host.Security.Rootless}}".into(),
+    ];
+    let info = podman_success(&podman, &info_args, "rootless verification")?;
+    if String::from_utf8_lossy(&info.stdout).trim() != "true" {
+        bail!("Podman is not running rootless; refusing podman-workspace sandbox");
+    }
+
+    let id = workspace_id(workspace);
+    let container = format!("hcs-{id}");
+    let state_root = match env_nonempty(PODMAN_STATE_ROOT_ENV) {
+        Some(root) => PathBuf::from(root).join(&id),
+        None => dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Cannot resolve HOME for Podman workspace state"))?
+            .join(".local/share/hcom-sandbox/workspaces")
+            .join(&id),
+    };
+    let pi_state = state_root.join("pi-agent");
+    let cache_state = state_root.join("cache");
+    let client_state = state_root.join("hcom-client");
+    for path in [&state_root, &pi_state, &cache_state, &client_state] {
+        ensure_private_dir(path)?;
+    }
+    seed_workspace_pi_credentials(&pi_state)?;
+    let lock_path = state_root.join("create.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .context("Failed to open Podman workspace lock")?;
+    crate::sys::fs::set_private(&lock_path)?;
+    lock_file(&lock)?;
+
+    let exists_args = vec!["container".into(), "exists".into(), container.clone()];
+    let exists = podman_output(&podman, &exists_args)?;
+    match exists.status.code() {
+        Some(0) => {
+            let label_id = inspect_value(
+                &podman,
+                &container,
+                "{{ index .Config.Labels \"io.hcom.workspace\" }}",
+            )?;
+            let label_path = inspect_value(
+                &podman,
+                &container,
+                "{{ index .Config.Labels \"io.hcom.workspace-path\" }}",
+            )?;
+            if label_id != id || label_path != workspace.to_string_lossy() {
+                bail!("Existing container {container} does not match workspace identity");
+            }
+        }
+        Some(1) => {
+            let image =
+                env_nonempty(PODMAN_IMAGE_ENV).unwrap_or_else(|| DEFAULT_PODMAN_IMAGE.to_string());
+            let mut create = vec![
+                "create".into(),
+                "--name".into(),
+                container.clone(),
+                "--label".into(),
+                format!("io.hcom.workspace={id}"),
+                "--label".into(),
+                format!("io.hcom.workspace-path={}", workspace.to_string_lossy()),
+                "--read-only".into(),
+                "--cap-drop=ALL".into(),
+                "--security-opt=no-new-privileges".into(),
+                // Rootless container uid 0 maps to the launching host user, not
+                // host root. Avoid keep-id: it forces Podman to chown-map the
+                // entire large image for every workspace and can exceed HCOM's
+                // launch deadline. Namespace root also preserves strict helper
+                // ownership checks while capabilities remain fully dropped.
+                "--user".into(),
+                "0:0".into(),
+                "--network=slirp4netns".into(),
+                "--pids-limit".into(),
+                env_nonempty(PODMAN_PIDS_LIMIT_ENV).unwrap_or_else(|| "512".into()),
+                "--memory".into(),
+                env_nonempty(PODMAN_MEMORY_ENV).unwrap_or_else(|| "4g".into()),
+                "--cpus".into(),
+                env_nonempty(PODMAN_CPUS_ENV).unwrap_or_else(|| "2".into()),
+            ];
+            for target in ["/tmp", "/run", "/var/tmp"] {
+                create.extend(["--tmpfs".into(), format!("{target}:rw,nosuid,nodev")]);
+            }
+            for mount in [
+                bind_mount_arg(workspace, workspace, false),
+                bind_mount_arg(&pi_state, &pi_state, false),
+                bind_mount_arg(&cache_state, &cache_state, false),
+                bind_mount_arg(&client_state, &client_state, false),
+            ] {
+                create.extend(["--volume".into(), mount]);
+            }
+            match (
+                env_nonempty("HCOM_BROKER_SOCKET").map(PathBuf::from),
+                env_nonempty("HCOM_BROKER_TOKEN_FILE").map(PathBuf::from),
+            ) {
+                (Some(socket), Some(token)) => {
+                    if !socket.is_absolute() || !socket.exists() {
+                        bail!("HCOM_BROKER_SOCKET must be an existing absolute path");
+                    }
+                    if !token.is_absolute() || !token.is_file() {
+                        bail!("HCOM_BROKER_TOKEN_FILE must be an existing absolute file");
+                    }
+                    let socket_parent = socket.parent().context("broker socket has no parent")?;
+                    if token.parent() != Some(socket_parent) {
+                        bail!("broker socket and token must share a directory");
+                    }
+                    // Mount the directory, not the socket inode, so a supervised
+                    // broker restart is visible inside an existing container.
+                    // Read-only prevents the worker replacing either credential.
+                    create.extend([
+                        "--volume".into(),
+                        bind_mount_arg(socket_parent, socket_parent, true),
+                    ]);
+                }
+                (None, None) => {}
+                _ => bail!("broker socket and token must be configured together"),
+            }
+            create.extend([image, "sleep".into(), "infinity".into()]);
+            podman_success(&podman, &create, "container creation")?;
+        }
+        _ => bail!(
+            "Podman container existence check failed (status {}): {}",
+            exists.status,
+            String::from_utf8_lossy(&exists.stderr).trim()
+        ),
+    }
+
+    if inspect_value(&podman, &container, "{{.State.Running}}")? != "true" {
+        podman_success(
+            &podman,
+            &["start".into(), container.clone()],
+            "container start",
+        )?;
+    }
+    drop(lock);
+
+    let container_command = match Path::new(&worker_command)
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        Some("pi") => "/usr/local/bin/pi-container-entry".to_string(),
+        Some("hcom") => "/usr/local/bin/hcom".to_string(),
+        _ => worker_command,
+    };
+    let mut args = vec![
+        "exec".into(),
+        "--interactive".into(),
+        "--tty".into(),
+        "--workdir".into(),
+        workspace.to_string_lossy().into_owned(),
+        "--env".into(),
+        "HOME=/home/pi".into(),
+        "--env".into(),
+        format!("PI_CODING_AGENT_DIR={}", pi_state.to_string_lossy()),
+        "--env".into(),
+        format!("HCOM_CLIENT_DIR={}", client_state.to_string_lossy()),
+        "--env".into(),
+        format!("{MODE_ENV}={PODMAN_WORKSPACE_MODE}"),
+        "--env".into(),
+        format!("{ROOT_ENV}={}", workspace.to_string_lossy()),
+    ];
+    for name in [
+        "HCOM_PROCESS_ID",
+        "HCOM_LAUNCHED",
+        "HCOM_TAG",
+        "HCOM_BROKER_SOCKET",
+        "HCOM_BROKER_TOKEN_FILE",
+    ] {
+        args.extend(["--env".into(), name.into()]);
+    }
+    args.extend([container, container_command]);
+    args.extend(worker_args);
+    Ok(WorkerCommand {
+        command: podman,
+        args,
+        _flock_helper: None,
+    })
+}
+
+fn seed_workspace_pi_credentials(pi_state: &Path) -> Result<()> {
+    let host_pi = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".pi/agent")))
+        .ok_or_else(|| anyhow::anyhow!("Cannot resolve host Pi state directory"))?;
+    for name in ["auth.json", "models.json"] {
+        let source = host_pi.join(name);
+        let destination = pi_state.join(name);
+        if !destination.exists() && source.is_file() {
+            copy_private_file(&source, &destination)?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -381,6 +666,305 @@ fn build_workspace_command(
 mod tests {
     use super::*;
     use crate::hooks::test_helpers::EnvGuard;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct VarGuard(Vec<(String, Option<std::ffi::OsString>)>);
+
+    impl VarGuard {
+        fn set(values: &[(&str, Option<&std::ffi::OsStr>)]) -> Self {
+            let saved = values
+                .iter()
+                .map(|(name, _)| ((*name).to_string(), std::env::var_os(name)))
+                .collect();
+            for (name, value) in values {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for VarGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    fn fake_podman(temp: &Path) -> PathBuf {
+        let bin = temp.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("podman");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+set -eu
+printf '%s\t' "$@" >> "$FAKE_PODMAN_LOG"
+printf '\n' >> "$FAKE_PODMAN_LOG"
+if [ "${FAKE_PODMAN_ROOTLESS:-true}" != true ] && [ "$1" = info ]; then
+  printf 'false\n'
+  exit 0
+fi
+if [ "$1" = info ]; then printf 'true\n'; exit 0; fi
+if [ "$1" = container ] && [ "$2" = exists ]; then
+  test -d "$FAKE_PODMAN_STATE/$3"
+  exit
+fi
+if [ "$1" = container ] && [ "$2" = inspect ]; then
+  format=$4
+  name=$5
+  case "$format" in
+    *workspace-path*) cat "$FAKE_PODMAN_STATE/$name/path" ;;
+    *workspace*) cat "$FAKE_PODMAN_STATE/$name/id" ;;
+    *Running*) test -f "$FAKE_PODMAN_STATE/$name/running" && printf 'true\n' || printf 'false\n' ;;
+    *) exit 44 ;;
+  esac
+  exit 0
+fi
+if [ "$1" = create ]; then
+  shift
+  name=
+  id=
+  path=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name) name=$2; shift 2 ;;
+      --label)
+        case "$2" in
+          io.hcom.workspace=*) id=${2#*=} ;;
+          io.hcom.workspace-path=*) path=${2#*=} ;;
+        esac
+        shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  mkdir -p "$FAKE_PODMAN_STATE/$name"
+  printf '%s\n' "$id" > "$FAKE_PODMAN_STATE/$name/id"
+  printf '%s\n' "$path" > "$FAKE_PODMAN_STATE/$name/path"
+  exit 0
+fi
+if [ "$1" = start ]; then touch "$FAKE_PODMAN_STATE/$2/running"; exit 0; fi
+exit 45
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        bin
+    }
+
+    #[test]
+    fn podman_workspace_is_scoped_persistent_and_minimally_mounted() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let hcom = home.join(".hcom");
+        let pi = home.join("host-pi-agent");
+        let workspace_a = temp.path().join("workspace-a");
+        let workspace_b = temp.path().join("workspace-b");
+        let state = temp.path().join("podman-state");
+        let log = temp.path().join("podman.log");
+        let broker_socket = temp.path().join("broker.sock");
+        let broker_token = temp.path().join("broker.token");
+        for path in [&home, &hcom, &pi, &workspace_a, &workspace_b, &state] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(&broker_socket, "socket placeholder").unwrap();
+        fs::write(&broker_token, "token").unwrap();
+        fs::write(pi.join("auth.json"), "host-auth").unwrap();
+        fs::write(pi.join("models.json"), "host-models").unwrap();
+        let bin = fake_podman(temp.path());
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let vars = [
+            ("HOME", Some(home.as_os_str())),
+            ("HCOM_DIR", Some(hcom.as_os_str())),
+            ("PI_CODING_AGENT_DIR", Some(pi.as_os_str())),
+            (MODE_ENV, Some(std::ffi::OsStr::new(PODMAN_WORKSPACE_MODE))),
+            (ROOT_ENV, Some(workspace_a.as_os_str())),
+            ("PATH", Some(std::ffi::OsStr::new(&path))),
+            ("FAKE_PODMAN_LOG", Some(log.as_os_str())),
+            ("FAKE_PODMAN_STATE", Some(state.as_os_str())),
+            ("FAKE_PODMAN_ROOTLESS", Some(std::ffi::OsStr::new("true"))),
+            ("HCOM_BROKER_SOCKET", Some(broker_socket.as_os_str())),
+            ("HCOM_BROKER_TOKEN_FILE", Some(broker_token.as_os_str())),
+        ];
+        let _vars = VarGuard::set(&vars);
+
+        let first =
+            wrap_worker_command("pi".into(), vec!["--model".into(), "x".into()], Some("one"))
+                .unwrap();
+        let second = wrap_worker_command("pi".into(), vec![], Some("two")).unwrap();
+        unsafe { std::env::set_var(ROOT_ENV, &workspace_b) };
+        let third = wrap_worker_command("pi".into(), vec![], Some("one")).unwrap();
+
+        let id_a = workspace_id(&workspace_a.canonicalize().unwrap());
+        let id_b = workspace_id(&workspace_b.canonicalize().unwrap());
+        assert_eq!(first.command, bin.join("podman").to_string_lossy());
+        assert!(first.args.iter().any(|arg| arg == &format!("hcs-{id_a}")));
+        assert!(second.args.iter().any(|arg| arg == &format!("hcs-{id_a}")));
+        assert!(third.args.iter().any(|arg| arg == &format!("hcs-{id_b}")));
+        assert_ne!(id_a, id_b);
+        assert!(first._flock_helper.is_none());
+        assert!(first.args.iter().any(|arg| arg == "--interactive"));
+        assert!(first.args.iter().any(|arg| arg == "--tty"));
+        assert!(
+            first
+                .args
+                .iter()
+                .any(|arg| arg == "/usr/local/bin/pi-container-entry")
+        );
+        assert!(
+            first
+                .args
+                .windows(2)
+                .any(|w| w == ["--workdir", workspace_a.to_string_lossy().as_ref()])
+        );
+        let root = home
+            .join(".local/share/hcom-sandbox/workspaces")
+            .join(&id_a);
+        for env in [
+            "HOME=/home/pi",
+            &format!("PI_CODING_AGENT_DIR={}", root.join("pi-agent").display()),
+            &format!("HCOM_CLIENT_DIR={}", root.join("hcom-client").display()),
+            "HCOM_PROCESS_ID",
+            "HCOM_LAUNCHED",
+            "HCOM_TAG",
+            "HCOM_BROKER_SOCKET",
+            "HCOM_BROKER_TOKEN_FILE",
+        ] {
+            assert!(first.args.windows(2).any(|w| w == ["--env", env]));
+        }
+        assert!(
+            !first
+                .args
+                .iter()
+                .any(|arg| arg == "HCOM_DIR" || arg.starts_with("HCOM_DIR="))
+        );
+        assert!(
+            !first
+                .args
+                .iter()
+                .any(|arg| arg == "PI_CODING_AGENT_SESSION_DIR")
+        );
+
+        let contents = fs::read_to_string(&log).unwrap();
+        let create_lines: Vec<_> = contents
+            .lines()
+            .filter(|line| line.starts_with("create\t"))
+            .collect();
+        assert_eq!(create_lines.len(), 2, "{contents}");
+        let create_a = create_lines
+            .iter()
+            .find(|line| line.contains(&format!("hcs-{id_a}")))
+            .unwrap();
+        assert!(create_a.contains("--user\t0:0"));
+        assert!(!create_a.contains("--userns=keep-id"));
+        assert!(create_a.contains("--cap-drop=ALL"));
+        assert!(create_a.contains("--security-opt=no-new-privileges"));
+        assert!(create_a.contains(&format!(
+            "{}:{}:rw",
+            workspace_a.display(),
+            workspace_a.display()
+        )));
+        for mount in [
+            format!("{0}:{0}:rw", root.join("pi-agent").display()),
+            format!("{0}:{0}:rw", root.join("cache").display()),
+            format!("{0}:{0}:rw", root.join("hcom-client").display()),
+        ] {
+            assert!(create_a.contains(&mount), "missing {mount} in {create_a}");
+        }
+        let broker_root = broker_socket.parent().unwrap();
+        assert!(create_a.contains(&format!(
+            "{}:{}:ro",
+            broker_root.display(),
+            broker_root.display()
+        )));
+        assert!(!create_a.contains(&format!(
+            "{}:{}:rw",
+            broker_socket.display(),
+            broker_socket.display()
+        )));
+        assert!(!create_a.contains("hcom.db"));
+        assert!(!create_a.contains("control.key"));
+        assert!(!create_a.contains(pi.to_string_lossy().as_ref()));
+        assert_eq!(
+            contents
+                .lines()
+                .filter(|line| line.starts_with("start\t"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            fs::read(root.join("pi-agent/auth.json")).unwrap(),
+            b"host-auth"
+        );
+        assert_eq!(
+            fs::read(root.join("pi-agent/models.json")).unwrap(),
+            b"host-models"
+        );
+        assert_eq!(
+            fs::metadata(root.join("pi-agent/auth.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::write(root.join("pi-agent/auth.json"), "workspace-auth").unwrap();
+        unsafe { std::env::set_var(ROOT_ENV, &workspace_a) };
+        wrap_worker_command("pi".into(), vec![], Some("three")).unwrap();
+        assert_eq!(
+            fs::read(root.join("pi-agent/auth.json")).unwrap(),
+            b"workspace-auth"
+        );
+        for path in [
+            root.clone(),
+            root.join("pi-agent"),
+            root.join("cache"),
+            root.join("hcom-client"),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn podman_workspace_fails_closed_when_not_rootless() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let bin = fake_podman(temp.path());
+        let log = temp.path().join("podman.log");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let _vars = VarGuard::set(&[
+            ("PATH", Some(std::ffi::OsStr::new(&path))),
+            ("FAKE_PODMAN_LOG", Some(log.as_os_str())),
+            ("FAKE_PODMAN_STATE", Some(state.as_os_str())),
+            ("FAKE_PODMAN_ROOTLESS", Some(std::ffi::OsStr::new("false"))),
+        ]);
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let error = match build_podman_workspace_command("pi".into(), vec![], &workspace) {
+            Ok(_) => panic!("non-rootless Podman unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not running rootless"));
+        assert!(!fs::read_to_string(log).unwrap().contains("create\t"));
+    }
 
     #[test]
     fn workspace_command_wraps_only_worker_and_limits_writable_mounts() {

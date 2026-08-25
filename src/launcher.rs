@@ -383,7 +383,17 @@ where
     // Explicit worker sandbox selection belongs to the new worker, not to the
     // parent agent identity. Preserve it even when a contaminated parent uses
     // a clean login-shell environment as the launch baseline.
-    for key in ["HCOM_WORKER_SANDBOX", "HCOM_WORKER_SANDBOX_ROOT"] {
+    for key in [
+        "HCOM_WORKER_SANDBOX",
+        "HCOM_WORKER_SANDBOX_ROOT",
+        "HCOM_PODMAN_IMAGE",
+        "HCOM_PODMAN_STATE_ROOT",
+        "HCOM_PODMAN_PIDS_LIMIT",
+        "HCOM_PODMAN_MEMORY",
+        "HCOM_PODMAN_CPUS",
+        "HCOM_BROKER_SOCKET",
+        "HCOM_BROKER_TOKEN_FILE",
+    ] {
         if let Ok(value) = std::env::var(key)
             && !value.is_empty()
         {
@@ -3066,9 +3076,13 @@ mod tests {
         let _guard = EnvVarGuard::remove(vec![
             "HCOM_WORKER_SANDBOX".to_string(),
             "HCOM_WORKER_SANDBOX_ROOT".to_string(),
+            "HCOM_BROKER_SOCKET".to_string(),
+            "HCOM_BROKER_TOKEN_FILE".to_string(),
         ]);
-        unsafe { std::env::set_var("HCOM_WORKER_SANDBOX", "workspace") };
+        unsafe { std::env::set_var("HCOM_WORKER_SANDBOX", "podman-workspace") };
         unsafe { std::env::set_var("HCOM_WORKER_SANDBOX_ROOT", "/repo") };
+        unsafe { std::env::set_var("HCOM_BROKER_SOCKET", "/run/hcom.sock") };
+        unsafe { std::env::set_var("HCOM_BROKER_TOKEN_FILE", "/run/hcom.token") };
 
         let config = crate::config::HcomConfig::default();
         let env =
@@ -3078,11 +3092,19 @@ mod tests {
 
         assert_eq!(
             env.get("HCOM_WORKER_SANDBOX").map(String::as_str),
-            Some("workspace")
+            Some("podman-workspace")
         );
         assert_eq!(
             env.get("HCOM_WORKER_SANDBOX_ROOT").map(String::as_str),
             Some("/repo")
+        );
+        assert_eq!(
+            env.get("HCOM_BROKER_SOCKET").map(String::as_str),
+            Some("/run/hcom.sock")
+        );
+        assert_eq!(
+            env.get("HCOM_BROKER_TOKEN_FILE").map(String::as_str),
+            Some("/run/hcom.token")
         );
     }
 

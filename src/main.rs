@@ -5,6 +5,7 @@
 //! as a side-channel for messaging and coordination with other agents.
 
 mod bootstrap;
+pub mod broker;
 mod claude_actor;
 mod cli_context;
 pub mod commands;
@@ -46,6 +47,14 @@ use std::panic;
 use std::str::FromStr;
 
 fn main() -> Result<()> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if broker::maybe_serve(&argv)? {
+        return Ok(());
+    }
+    if let Some(status) = broker::maybe_forward(&argv)? {
+        std::process::exit(status);
+    }
+
     // Initialize global config from environment variables
     config::Config::init();
 

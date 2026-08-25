@@ -179,6 +179,10 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	}
 
 	function startNotifyServer(): Promise<number | null> {
+		// A container-local loopback port is not reachable by the host broker.
+		// Broker mode therefore uses the existing fast polling fallback until a
+		// broker wake subscription is established.
+		if (process.env.HCOM_BROKER_SOCKET) return Promise.resolve(null);
 		if (notifyServer && notifyPort) return Promise.resolve(notifyPort);
 		return new Promise((resolve) => {
 			const server = createServer((socket) => {

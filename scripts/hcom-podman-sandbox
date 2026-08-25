@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: hcom-podman-sandbox [--workspace DIR] [hcom launch arguments...]
+
+Launch HCOM workers in one persistent rootless Podman environment per canonical
+workspace. All workspaces join the host-global HCOM realm through an authenticated
+Unix-socket broker; host HCOM database and keys are never mounted into containers.
+
+Examples:
+  hcom-podman-sandbox 1 pi
+  hcom-podman-sandbox --workspace /path/to/project 1 pi --tag critical
+
+Environment:
+  HCOM_PODMAN_IMAGE       OCI image (default localhost/hcom-pi-workspace:live)
+  HCOM_PODMAN_STATE_ROOT  Persistent workspace state root
+  HCOM_BROKER_ROOT        Host broker runtime root
+EOF
+}
+
+workspace=$PWD
+args=()
+while (($#)); do
+  case "$1" in
+    --workspace)
+      (($# >= 2)) || { printf 'hcom-podman-sandbox: --workspace requires a directory\n' >&2; exit 2; }
+      workspace=$2; shift 2 ;;
+    --workspace=*) workspace=${1#*=}; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+((${#args[@]})) || { usage >&2; exit 2; }
+
+for command in hcom podman realpath sha256sum flock; do
+  command -v "$command" >/dev/null 2>&1 || {
+    printf 'hcom-podman-sandbox: required command missing: %s\n' "$command" >&2
+    exit 1
+  }
+done
+[[ -d "$workspace" ]] || { printf 'hcom-podman-sandbox: workspace is not a directory: %s\n' "$workspace" >&2; exit 1; }
+workspace=$(realpath -e -- "$workspace")
+home=$(realpath -e -- "$HOME")
+hcom_dir=$(realpath -e -- "${HCOM_DIR:-$HOME/.hcom}")
+[[ "$workspace" != / && "$workspace" != "$home" ]] || {
+  printf 'hcom-podman-sandbox: refusing unsafe workspace %s\n' "$workspace" >&2; exit 1;
+}
+case "$hcom_dir/" in "$workspace"/*) printf 'hcom-podman-sandbox: workspace contains HCOM state\n' >&2; exit 1;; esac
+
+podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -qx true || {
+  printf 'hcom-podman-sandbox: Podman is unavailable or not rootless\n' >&2; exit 1;
+}
+image=${HCOM_PODMAN_IMAGE:-localhost/hcom-pi-workspace:live}
+podman image exists "$image" || {
+  printf 'hcom-podman-sandbox: image is missing: %s\n' "$image" >&2
+  printf 'Build it from hcom-src/packaging/podman-workspace first.\n' >&2
+  exit 1
+}
+
+id=$(printf '%s' "$workspace" | sha256sum | cut -c1-20)
+broker_root=${HCOM_BROKER_ROOT:-$HOME/.local/share/hcom-sandbox/brokers/$id}
+mkdir -p "$broker_root"
+chmod 700 "$broker_root"
+socket=$broker_root/hcom.sock
+token=$broker_root/token
+lock=$broker_root/start.lock
+if [[ ! -f "$token" ]]; then
+  umask 077
+  head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$token.tmp"
+  mv "$token.tmp" "$token"
+fi
+chmod 600 "$token"
+
+exec 9>"$lock"
+flock 9
+unit=hcom-workspace-broker-$id.service
+if [[ ! -S "$socket" ]] || ! HCOM_BROKER_SOCKET="$socket" HCOM_BROKER_TOKEN_FILE="$token" hcom status >/dev/null 2>&1; then
+  command -v systemctl >/dev/null 2>&1 && command -v systemd-run >/dev/null 2>&1 || {
+    printf 'hcom-podman-sandbox: systemd user services are required for the broker\n' >&2
+    exit 1
+  }
+  systemctl --user show-environment >/dev/null 2>&1 || {
+    printf 'hcom-podman-sandbox: systemd user manager is unavailable\n' >&2
+    exit 1
+  }
+  systemctl --user stop "$unit" >/dev/null 2>&1 || true
+  systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+  rm -f "$socket"
+  hcom_bin=$(command -v hcom)
+  systemd-run --user --quiet --unit "$unit" \
+    --property=Restart=on-failure --property=RestartSec=1s \
+    --property="StandardOutput=append:$broker_root/broker.out" \
+    --property="StandardError=append:$broker_root/broker.err" \
+    "$hcom_bin" broker-serve --socket "$socket" --token-file "$token" --workspace "$workspace"
+  for _ in $(seq 1 100); do
+    [[ -S "$socket" ]] && HCOM_BROKER_SOCKET="$socket" HCOM_BROKER_TOKEN_FILE="$token" hcom status >/dev/null 2>&1 && break
+    sleep 0.05
+  done
+  [[ -S "$socket" ]] && HCOM_BROKER_SOCKET="$socket" HCOM_BROKER_TOKEN_FILE="$token" hcom status >/dev/null 2>&1 || {
+    printf 'hcom-podman-sandbox: broker failed to start; inspect: journalctl --user -u %s\n' "$unit" >&2
+    exit 1
+  }
+  systemctl --user show "$unit" -p MainPID --value > "$broker_root/broker.pid"
+fi
+flock -u 9
+
+cat >&2 <<EOF
+HCOM PODMAN WORKSPACE
+workspace: $workspace
+image:     $image
+container: hcs-$id
+state:     ${HCOM_PODMAN_STATE_ROOT:-$HOME/.local/share/hcom-sandbox/workspaces}/$id
+realm:     host-global HCOM via authenticated broker
+host data: HCOM DB/key not mounted
+rootfs:    read-only; workspace + private state writable
+fallback:  disabled
+EOF
+
+export HCOM_WORKER_SANDBOX=podman-workspace
+export HCOM_WORKER_SANDBOX_ROOT=$workspace
+export HCOM_PODMAN_IMAGE=$image
+export HCOM_BROKER_SOCKET=$socket
+export HCOM_BROKER_TOKEN_FILE=$token
+exec hcom "${args[@]}"

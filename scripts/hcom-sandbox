@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: hcom-sandbox [--mode MODE] [--workspace DIR] [hcom launch arguments...]
+
+Modes:
+  podman-workspace  Persistent rootless Podman sandbox per workspace (default)
+  workspace         Legacy identity-scoped bubblewrap sandbox
+  off               Launch without an OS sandbox
+
+Examples:
+  hcom-sandbox 1 pi
+  hcom-sandbox --workspace /path/to/project 1 pi --tag critical
+  hcom-sandbox --mode workspace 1 pi
+
+Podman mode keeps Pi state per workspace and joins the host-global HCOM realm
+through an authenticated, systemd-supervised Unix-socket broker. HCOM DB/key are
+never mounted into the container. Bubblewrap remains available for migration.
+EOF
+}
+
+mode=${HCOM_SANDBOX_MODE:-podman-workspace}
+workspace=$PWD
+args=()
+while (($#)); do
+  case "$1" in
+    --mode) (($# >= 2)) || { echo 'hcom-sandbox: --mode requires a value' >&2; exit 2; }; mode=$2; shift 2 ;;
+    --mode=*) mode=${1#*=}; shift ;;
+    --workspace) (($# >= 2)) || { echo 'hcom-sandbox: --workspace requires a directory' >&2; exit 2; }; workspace=$2; shift 2 ;;
+    --workspace=*) workspace=${1#*=}; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+((${#args[@]})) || { usage >&2; exit 2; }
+[[ -d "$workspace" ]] || { printf 'hcom-sandbox: workspace is not a directory: %s\n' "$workspace" >&2; exit 1; }
+workspace=$(realpath -e -- "$workspace")
+
+case "$mode" in
+  podman-workspace)
+    exec hcom-podman-sandbox --workspace "$workspace" "${args[@]}"
+    ;;
+  off)
+    cd "$workspace"
+    export HCOM_WORKER_SANDBOX=off
+    unset HCOM_WORKER_SANDBOX_ROOT HCOM_BROKER_SOCKET HCOM_BROKER_TOKEN_FILE
+    exec hcom "${args[@]}"
+    ;;
+  workspace)
+    command -v bwrap >/dev/null 2>&1 || { echo 'hcom-sandbox: bwrap is required for workspace mode' >&2; exit 1; }
+    home=$(realpath -e -- "$HOME")
+    hcom_dir=$(realpath -e -- "${HCOM_DIR:-$HOME/.hcom}")
+    [[ "$workspace" != / && "$workspace" != "$home" ]] || { printf 'hcom-sandbox: refusing unsafe workspace %s\n' "$workspace" >&2; exit 1; }
+    case "$hcom_dir/" in "$workspace"/*) echo 'hcom-sandbox: workspace contains HCOM state' >&2; exit 1;; esac
+    cat >&2 <<EOF
+HCOM LEGACY WORKSPACE SANDBOX
+workspace: $workspace
+root:      read-only bubblewrap view
+state:     identity-scoped private runtime
+sessions:  native cwd-scoped Pi catalog
+fallback:  disabled
+EOF
+    cd "$workspace"
+    export HCOM_WORKER_SANDBOX=workspace
+    export HCOM_WORKER_SANDBOX_ROOT=$workspace
+    unset HCOM_BROKER_SOCKET HCOM_BROKER_TOKEN_FILE
+    exec hcom "${args[@]}"
+    ;;
+  *) printf 'hcom-sandbox: unsupported mode: %s\n' "$mode" >&2; exit 2 ;;
+esac

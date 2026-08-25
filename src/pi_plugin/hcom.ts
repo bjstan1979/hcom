@@ -313,11 +313,8 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			const formatted = formatMessagesForInjection(pending.messages, instanceName);
 			pendingAckId = pending.maxId;
 			try {
-				// sendUserMessage is the sole model input. In RPC mode Pi does not emit
-				// externally injected user messages as ACP updates, so mirror the text
-				// through the existing notification bridge for Happy/mobile visibility.
-				// This is display-only and does not create a second delivery channel.
-				if (ctx.mode === "rpc") ctx.ui.notify(formatted);
+				// sendUserMessage is the sole model input. RPC adapters surface the
+				// resulting user message directly; do not mirror it as an agent notice.
 				if (ctx.isIdle()) {
 					await pi.sendUserMessage(formatted);
 				} else {

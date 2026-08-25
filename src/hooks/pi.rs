@@ -474,14 +474,10 @@ mod tests {
     }
 
     #[test]
-    fn plugin_mirrors_rpc_delivery_for_acp_visibility_only() {
-        assert!(PLUGIN_SOURCE.contains("if (ctx.mode === \"rpc\") ctx.ui.notify(formatted)"));
-        assert_eq!(
-            PLUGIN_SOURCE.matches("ctx.ui.notify(formatted)").count(),
-            1,
-            "RPC visibility mirror must remain a single display-only notification"
-        );
+    fn plugin_leaves_rpc_visibility_to_the_adapter_without_duplicate_notice() {
+        assert!(!PLUGIN_SOURCE.contains("ctx.ui.notify(formatted)"));
         assert!(PLUGIN_SOURCE.contains("sendUserMessage is the sole model input"));
+        assert!(PLUGIN_SOURCE.contains("do not mirror it as an agent notice"));
         assert!(PLUGIN_SOURCE.contains("await pi.sendUserMessage(formatted)"));
         assert!(
             PLUGIN_SOURCE

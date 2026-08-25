@@ -169,10 +169,136 @@ fn push_bind(args: &mut Vec<String>, source: &Path, destination: &Path) {
     args.push(destination.to_string_lossy().into_owned());
 }
 
+fn option_value(args: &[String], name: &str) -> Option<String> {
+    args.iter().enumerate().find_map(|(index, arg)| {
+        if arg == name {
+            args.get(index + 1).cloned()
+        } else {
+            arg.strip_prefix(&format!("{name}=")).map(str::to_owned)
+        }
+    })
+}
+
+fn replace_option_value(args: &mut [String], name: &str, value: &Path) {
+    let replacement = value.to_string_lossy().into_owned();
+    let equals_prefix = format!("{name}=");
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == name {
+            if let Some(next) = args.get_mut(index + 1) {
+                *next = replacement.clone();
+            }
+            index += 2;
+        } else if args[index].starts_with(&equals_prefix) {
+            args[index] = format!("{name}={replacement}");
+            index += 1;
+        } else {
+            index += 1;
+        }
+    }
+}
+
+/// Migrate a cross-worker Pi resume into the new worker's private session
+/// directory. Arbitrary source directories are rejected: the source must be
+/// exactly another HCOM sandbox's `pi-sessions` directory and contain one
+/// regular transcript matching the explicit session id. Copying avoids making
+/// any part of the former worker's runtime writable in the new namespace.
+fn migrate_cross_worker_resume(
+    worker_command: &str,
+    worker_args: &mut [String],
+    hcom_dir: &Path,
+    own_sessions: &Path,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    let command_name = Path::new(worker_command)
+        .file_name()
+        .and_then(|name| name.to_str());
+    if !matches!(command_name, Some("pi" | "pi-agent")) {
+        return Ok(None);
+    }
+
+    let (Some(session_dir), Some(session_id)) = (
+        option_value(worker_args, "--session-dir"),
+        option_value(worker_args, "--session"),
+    ) else {
+        return Ok(None);
+    };
+    if session_id.is_empty()
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id == "."
+        || session_id == ".."
+    {
+        bail!("Refusing unsafe Pi resume session id: {session_id}");
+    }
+
+    let session_dir = PathBuf::from(session_dir)
+        .canonicalize()
+        .context("Cannot resolve Pi resume session directory")?;
+    let own_sessions = own_sessions
+        .canonicalize()
+        .context("Cannot resolve worker Pi session directory")?;
+    if session_dir == own_sessions {
+        return Ok(None);
+    }
+
+    let sandboxes = hcom_dir
+        .join("sandboxes")
+        .canonicalize()
+        .context("Cannot resolve HCOM sandbox directory while validating Pi resume")?;
+    let relative = session_dir.strip_prefix(&sandboxes).map_err(|_| {
+        anyhow::anyhow!(
+            "Refusing Pi resume directory outside HCOM sandboxes: {}",
+            session_dir.display()
+        )
+    })?;
+    let components: Vec<_> = relative.components().collect();
+    if components.len() != 2
+        || components[1].as_os_str() != "pi-sessions"
+        || components[0].as_os_str().is_empty()
+    {
+        bail!(
+            "Refusing non-standard HCOM Pi resume directory: {}",
+            session_dir.display()
+        );
+    }
+
+    let suffix = format!("_{session_id}.jsonl");
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(&session_dir)
+        .with_context(|| format!("Cannot read Pi resume directory {}", session_dir.display()))?
+    {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && entry.file_name().to_string_lossy().ends_with(&suffix) {
+            matches.push(entry.path());
+        }
+    }
+    if matches.len() != 1 {
+        bail!(
+            "Expected exactly one transcript for Pi session {session_id} in {}, found {}",
+            session_dir.display(),
+            matches.len()
+        );
+    }
+    let source = matches.pop().expect("one transcript was validated");
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Pi resume transcript has no file name"))?;
+    let destination = own_sessions.join(file_name);
+    if destination.exists() {
+        bail!(
+            "Refusing to overwrite existing migrated Pi transcript: {}",
+            destination.display()
+        );
+    }
+    copy_private_file(&source, &destination)?;
+    replace_option_value(worker_args, "--session-dir", &own_sessions);
+    Ok(Some((source, destination)))
+}
+
 fn build_workspace_command(
     bwrap: String,
     worker_command: String,
-    worker_args: Vec<String>,
+    mut worker_args: Vec<String>,
     workspace: &Path,
     hcom_dir: &Path,
     instance: &str,
@@ -184,6 +310,7 @@ fn build_workspace_command(
     for dir in [&sandbox_root, &sandbox_hcom, &sandbox_pi, &sessions] {
         ensure_private_dir(dir)?;
     }
+    migrate_cross_worker_resume(&worker_command, &mut worker_args, hcom_dir, &sessions)?;
     ensure_private_dir(&sandbox_hcom.join(".tmp/logs"))?;
     ensure_private_dir(&sandbox_hcom.join("pi-delivery"))?;
 
@@ -503,6 +630,121 @@ if printf tampered >> "$PI_CODING_AGENT_DIR/agents/Explore.md" 2>/dev/null; then
             "child"
         );
         assert_eq!(fs::read_to_string(outside).unwrap(), "host");
+    }
+
+    #[test]
+    fn cross_worker_pi_resume_migrates_only_selected_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let hcom_dir = temp.path().join("hcom-state");
+        let former_sessions = hcom_dir.join("sandboxes/vera/pi-sessions");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&former_sessions).unwrap();
+        let selected = former_sessions.join("2026-08-25T00-00-00Z_session-123.jsonl");
+        let sibling = former_sessions.join("2026-08-25T00-00-01Z_session-456.jsonl");
+        fs::write(&selected, "selected\n").unwrap();
+        fs::write(&sibling, "sibling\n").unwrap();
+
+        let Some(bwrap) = crate::terminal::which_bin("bwrap") else {
+            return;
+        };
+        let fake_bin = workspace.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_pi = fake_bin.join("pi");
+        fs::write(&fake_pi, "#!/bin/bash\nexec /bin/bash \"$@\"\n").unwrap();
+        let mut permissions = fs::metadata(&fake_pi).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        fs::set_permissions(&fake_pi, permissions).unwrap();
+        let migrated = hcom_dir
+            .join("sandboxes/sana/pi-sessions")
+            .join(selected.file_name().unwrap());
+        let script = r#"
+set -eu
+printf resumed >> "$1"
+if printf source-tamper >> "$2" 2>/dev/null; then exit 92; fi
+if printf sibling-tamper >> "$3" 2>/dev/null; then exit 93; fi
+if printf directory-tamper > "$4/new.jsonl" 2>/dev/null; then exit 94; fi
+"#;
+        let wrapped = build_workspace_command(
+            bwrap,
+            fake_pi.to_string_lossy().into_owned(),
+            vec![
+                "-c".into(),
+                script.into(),
+                "bash".into(),
+                migrated.to_string_lossy().into_owned(),
+                selected.to_string_lossy().into_owned(),
+                sibling.to_string_lossy().into_owned(),
+                former_sessions.to_string_lossy().into_owned(),
+                "--session-dir".into(),
+                former_sessions.to_string_lossy().into_owned(),
+                "--session".into(),
+                "session-123".into(),
+            ],
+            &workspace,
+            &hcom_dir,
+            "sana",
+        )
+        .unwrap();
+
+        assert!(wrapped.args.windows(2).any(|w| {
+            w[0] == "--session-dir"
+                && w[1]
+                    == hcom_dir
+                        .join("sandboxes/sana/pi-sessions")
+                        .to_string_lossy()
+        }));
+        assert!(!wrapped.args.windows(3).any(|w| {
+            w[0] == "--bind"
+                && (w[1] == selected.to_string_lossy()
+                    || w[1] == former_sessions.to_string_lossy()
+                    || w[1] == sibling.to_string_lossy())
+        }));
+
+        let output = std::process::Command::new(&wrapped.command)
+            .args(&wrapped.args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "bwrap resume probe failed with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(&migrated).unwrap(), "selected\nresumed");
+        assert_eq!(fs::read_to_string(&selected).unwrap(), "selected\n");
+        assert_eq!(fs::read_to_string(&sibling).unwrap(), "sibling\n");
+        assert!(!former_sessions.join("new.jsonl").exists());
+    }
+
+    #[test]
+    fn cross_worker_pi_resume_rejects_arbitrary_session_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let hcom_dir = temp.path().join("hcom-state");
+        let arbitrary = temp.path().join("arbitrary");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&hcom_dir).unwrap();
+        fs::create_dir_all(&arbitrary).unwrap();
+        fs::write(arbitrary.join("session-123.jsonl"), "unsafe\n").unwrap();
+
+        let result = build_workspace_command(
+            "bwrap".into(),
+            "pi".into(),
+            vec![
+                format!("--session-dir={}", arbitrary.display()),
+                "--session=session-123".into(),
+            ],
+            &workspace,
+            &hcom_dir,
+            "sana",
+        );
+
+        let error = match result {
+            Ok(_) => panic!("arbitrary Pi session directory was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("outside HCOM sandboxes"));
     }
 
     #[test]

@@ -330,6 +330,11 @@ fn build_podman_workspace_command(
         "--env".into(),
         format!("HCOM_CLIENT_DIR={}", client_state.to_string_lossy()),
         "--env".into(),
+        // Extensions such as zz-hcom-supervisor need durable, writable HCOM-
+        // adjacent state. Keep it workspace-private rather than exposing the
+        // host-global HCOM database/key or making the container HOME writable.
+        format!("HCOM_DIR={}", client_state.to_string_lossy()),
+        "--env".into(),
         format!("{MODE_ENV}={PODMAN_WORKSPACE_MODE}"),
         "--env".into(),
         format!("{ROOT_ENV}={}", workspace.to_string_lossy()),
@@ -837,6 +842,7 @@ exit 45
             "HOME=/home/pi",
             &format!("PI_CODING_AGENT_DIR={}", root.join("pi-agent").display()),
             &format!("HCOM_CLIENT_DIR={}", root.join("hcom-client").display()),
+            &format!("HCOM_DIR={}", root.join("hcom-client").display()),
             "HCOM_PROCESS_ID",
             "HCOM_LAUNCHED",
             "HCOM_TAG",
@@ -845,12 +851,7 @@ exit 45
         ] {
             assert!(first.args.windows(2).any(|w| w == ["--env", env]));
         }
-        assert!(
-            !first
-                .args
-                .iter()
-                .any(|arg| arg == "HCOM_DIR" || arg.starts_with("HCOM_DIR="))
-        );
+        assert!(!first.args.iter().any(|arg| arg == "HCOM_DIR"));
         assert!(
             !first
                 .args

@@ -5,7 +5,8 @@
 //! not need broad writable access inside the sandbox.
 
 use anyhow::{Context, Result, bail};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 const MODE_ENV: &str = "HCOM_WORKER_SANDBOX";
@@ -15,6 +16,9 @@ const WORKSPACE_MODE: &str = "workspace";
 pub struct WorkerCommand {
     pub command: String,
     pub args: Vec<String>,
+    // Keep the source fd alive until bubblewrap has consumed --ro-bind-data.
+    // The fd is opened read-only from the host's trusted /usr/bin/flock.
+    pub(crate) _flock_helper: Option<File>,
 }
 
 pub fn wrap_worker_command(
@@ -24,7 +28,11 @@ pub fn wrap_worker_command(
 ) -> Result<WorkerCommand> {
     let mode = std::env::var(MODE_ENV).unwrap_or_default();
     if mode.is_empty() || mode == "off" {
-        return Ok(WorkerCommand { command, args });
+        return Ok(WorkerCommand {
+            command,
+            args,
+            _flock_helper: None,
+        });
     }
     if mode != WORKSPACE_MODE {
         bail!("Unsupported HCOM worker sandbox mode: {mode}");
@@ -228,20 +236,54 @@ fn build_workspace_command(
         ensure_private_file(&sandbox_hcom.join(file))?;
     }
 
+    // bubblewrap's user namespace maps namespace root to the launching user;
+    // it is not host root. We use namespace root so --ro-bind-data can create
+    // a root-owned, non-writable helper inode in the private /run tmpfs for
+    // plugins that perform fail-closed helper ownership checks.
+    let flock_helper = File::open("/usr/bin/flock")
+        .context("Cannot open trusted /usr/bin/flock for sandbox injection")?;
+    // The descriptor is passed as a numeric bwrap argument, so it must survive
+    // exec. std::fs::File otherwise carries close-on-exec on Unix.
+    let flock_fd_raw = flock_helper.as_raw_fd();
+    let flags = unsafe { libc::fcntl(flock_fd_raw, libc::F_GETFD) };
+    if flags < 0
+        || unsafe { libc::fcntl(flock_fd_raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
+    {
+        bail!("Cannot prepare /usr/bin/flock descriptor for sandbox injection");
+    }
+    let flock_fd = flock_fd_raw.to_string();
+
     let mut args = vec![
         "--die-with-parent".into(),
         "--new-session".into(),
         "--unshare-pid".into(),
+        "--unshare-user".into(),
+        "--uid".into(),
+        "0".into(),
+        "--gid".into(),
+        "0".into(),
         "--ro-bind".into(),
         "/".into(),
         "/".into(),
         "--tmpfs".into(),
         "/tmp".into(),
+        "--tmpfs".into(),
+        "/run".into(),
         "--proc".into(),
         "/proc".into(),
         "--dev-bind".into(),
         "/dev".into(),
         "/dev".into(),
+        "--perms".into(),
+        "0755".into(),
+        "--file".into(),
+        flock_fd,
+        "/run/flock".into(),
+        "--remount-ro".into(),
+        "/run".into(),
+        "--setenv".into(),
+        "PI_POSITION_FLOCK_HELPER".into(),
+        "/run/flock".into(),
     ];
 
     // The whole host starts read-only. Re-open only the project and this
@@ -293,6 +335,7 @@ fn build_workspace_command(
     Ok(WorkerCommand {
         command: bwrap,
         args,
+        _flock_helper: Some(flock_helper),
     })
 }
 
@@ -344,6 +387,31 @@ mod tests {
                     .as_ref(),
             ]
         }));
+        assert!(
+            wrapped
+                .args
+                .windows(3)
+                .any(|w| w == ["--unshare-user", "--uid", "0"])
+        );
+        assert!(
+            wrapped
+                .args
+                .windows(3)
+                .any(|w| w == ["--gid", "0", "--ro-bind"])
+        );
+        assert!(
+            wrapped
+                .args
+                .windows(3)
+                .any(|w| { w[0] == "--file" && w[2] == "/run/flock" })
+        );
+        assert!(wrapped._flock_helper.is_some());
+        assert!(
+            wrapped
+                .args
+                .windows(3)
+                .any(|w| w == ["--setenv", "PI_POSITION_FLOCK_HELPER", "/run/flock"])
+        );
         assert!(wrapped.args.windows(3).any(|w| {
             w == [
                 "--setenv",

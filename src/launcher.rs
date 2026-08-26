@@ -395,6 +395,7 @@ where
         "HCOM_BROKER_TOKEN_FILE",
         "AGENTMEMORY_SOCKET",
         "ANYSEARCH_SOCKET",
+        "MMX_SOCKET",
     ] {
         if let Ok(value) = std::env::var(key)
             && !value.is_empty()

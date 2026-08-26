@@ -66,6 +66,12 @@ if [ -f "$seed/extensions/agentmemory/index.ts" ]; then
   cp --no-preserve=ownership "$seed/extensions/agentmemory/index.ts" \
     "$runtime/extensions/agentmemory/index.ts"
 fi
+for extension in anysearch.ts mmx.ts; do
+  if [ -f "$seed/extensions/$extension" ]; then
+    mkdir -p "$runtime/extensions"
+    cp --no-preserve=ownership "$seed/extensions/$extension" "$runtime/extensions/$extension"
+  fi
+done
 exec /usr/local/bin/pi "$@"
 EOF
 chmod 0755 "$out/rootfs/usr/local/bin/pi" "$out/rootfs/usr/local/bin/pi-container-entry"

@@ -22,6 +22,7 @@ const PODMAN_MEMORY_ENV: &str = "HCOM_PODMAN_MEMORY";
 const PODMAN_CPUS_ENV: &str = "HCOM_PODMAN_CPUS";
 const AGENTMEMORY_SOCKET_ENV: &str = "AGENTMEMORY_SOCKET";
 const ANYSEARCH_SOCKET_ENV: &str = "ANYSEARCH_SOCKET";
+const MMX_SOCKET_ENV: &str = "MMX_SOCKET";
 const DEFAULT_PODMAN_IMAGE: &str = "localhost/hcom-pi-workspace:live";
 
 pub struct WorkerCommand {
@@ -291,7 +292,7 @@ fn build_podman_workspace_command(
             ] {
                 create.extend(["--volume".into(), mount]);
             }
-            for env_name in [AGENTMEMORY_SOCKET_ENV, ANYSEARCH_SOCKET_ENV] {
+            for env_name in [AGENTMEMORY_SOCKET_ENV, ANYSEARCH_SOCKET_ENV, MMX_SOCKET_ENV] {
                 if let Some(socket) = env_nonempty(env_name).map(PathBuf::from) {
                     if !socket.is_absolute() || !socket.exists() {
                         bail!("{env_name} must be an existing absolute path");
@@ -384,6 +385,7 @@ fn build_podman_workspace_command(
         "HCOM_BROKER_TOKEN_FILE",
         AGENTMEMORY_SOCKET_ENV,
         ANYSEARCH_SOCKET_ENV,
+        MMX_SOCKET_ENV,
     ] {
         args.extend(["--env".into(), name.into()]);
     }
@@ -894,11 +896,22 @@ exit 45
         let log = temp.path().join("podman.log");
         let broker_socket = temp.path().join("broker.sock");
         let broker_token = temp.path().join("broker.token");
-        for path in [&home, &hcom, &pi, &workspace_a, &workspace_b, &state] {
+        let mmx_bridge = temp.path().join("mmx-bridge");
+        let mmx_socket = mmx_bridge.join("mmx.sock");
+        for path in [
+            &home,
+            &hcom,
+            &pi,
+            &workspace_a,
+            &workspace_b,
+            &state,
+            &mmx_bridge,
+        ] {
             fs::create_dir_all(path).unwrap();
         }
         fs::write(&broker_socket, "socket placeholder").unwrap();
         fs::write(&broker_token, "token").unwrap();
+        fs::write(&mmx_socket, "socket placeholder").unwrap();
         fs::write(pi.join("auth.json"), "host-auth").unwrap();
         fs::write(pi.join("models.json"), "host-models").unwrap();
         let bin = fake_podman(temp.path());
@@ -915,6 +928,7 @@ exit 45
             ("FAKE_PODMAN_ROOTLESS", Some(std::ffi::OsStr::new("true"))),
             ("HCOM_BROKER_SOCKET", Some(broker_socket.as_os_str())),
             ("HCOM_BROKER_TOKEN_FILE", Some(broker_token.as_os_str())),
+            (MMX_SOCKET_ENV, Some(mmx_socket.as_os_str())),
         ];
         let _vars = VarGuard::set(&vars);
 
@@ -971,6 +985,7 @@ exit 45
             "HCOM_TAG",
             "HCOM_BROKER_SOCKET",
             "HCOM_BROKER_TOKEN_FILE",
+            MMX_SOCKET_ENV,
         ] {
             assert!(first.args.windows(2).any(|w| w == ["--env", env]));
         }
@@ -1018,6 +1033,16 @@ exit 45
             "{}:{}:rw",
             broker_socket.display(),
             broker_socket.display()
+        )));
+        assert!(create_a.contains(&format!(
+            "{}:{}:ro",
+            mmx_bridge.display(),
+            mmx_bridge.display()
+        )));
+        assert!(!create_a.contains(&format!(
+            "{}:{}:rw",
+            mmx_bridge.display(),
+            mmx_bridge.display()
         )));
         assert!(!create_a.contains("hcom.db"));
         assert!(!create_a.contains("control.key"));

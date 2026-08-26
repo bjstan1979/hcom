@@ -123,7 +123,7 @@ export HCOM_WORKER_SANDBOX_ROOT=$workspace
 export HCOM_PODMAN_IMAGE=$image
 export HCOM_BROKER_SOCKET=$socket
 export HCOM_BROKER_TOKEN_FILE=$token
-for bridge in AGENTMEMORY ANYSEARCH; do
+for bridge in AGENTMEMORY ANYSEARCH MMX; do
   var=${bridge}_SOCKET
   default=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${bridge,,}-bridge/${bridge,,}.sock
   socket=${!var:-$default}

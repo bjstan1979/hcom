@@ -463,7 +463,21 @@ fn seed_workspace_pi_credentials(pi_state: &Path) -> Result<()> {
     for name in ["auth.json", "models.json"] {
         let source = host_pi.join(name);
         let destination = pi_state.join(name);
-        if !destination.exists() && source.is_file() {
+        if !source.is_file() {
+            continue;
+        }
+        // Workspace credentials are private copies, not mounts. Refresh only
+        // when the host copy is newer, so an explicit host /login reaches an
+        // existing persistent sandbox without overwriting credentials changed
+        // inside the sandbox or touching session state.
+        let host_updated = match (source.metadata()?.modified(), destination.metadata()) {
+            (Ok(source_time), Ok(destination_meta)) => match destination_meta.modified() {
+                Ok(destination_time) => source_time > destination_time,
+                Err(_) => true,
+            },
+            _ => true,
+        };
+        if host_updated {
             copy_private_file(&source, &destination)?;
         }
     }
@@ -1037,6 +1051,15 @@ exit 45
         assert_eq!(
             fs::read(root.join("pi-agent/auth.json")).unwrap(),
             b"workspace-auth"
+        );
+        // A later host /login is propagated on the next worker start without
+        // mounting the host credential file into the container.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(pi.join("auth.json"), "new-host-auth").unwrap();
+        wrap_worker_command("pi".into(), vec![], Some("four")).unwrap();
+        assert_eq!(
+            fs::read(root.join("pi-agent/auth.json")).unwrap(),
+            b"new-host-auth"
         );
         for path in [
             root.clone(),

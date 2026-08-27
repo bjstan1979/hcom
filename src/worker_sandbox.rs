@@ -327,7 +327,17 @@ fn build_podman_workspace_command(
                 (None, None) => {}
                 _ => bail!("broker socket and token must be configured together"),
             }
-            create.extend([image, "sleep".into(), "infinity".into()]);
+            // Run a real init as PID 1. Long-lived workspace containers spawn
+            // multiprocessing searches and detached helpers; plain `sleep`
+            // neither forwards signals nor reaps orphaned children, eventually
+            // filling the pids limit with zombies and making the Pi TUI sluggish.
+            create.extend([
+                image,
+                "/usr/bin/tini".into(),
+                "--".into(),
+                "sleep".into(),
+                "infinity".into(),
+            ]);
             podman_success(&podman, &create, "container creation")?;
         }
         _ => bail!(
@@ -1045,6 +1055,7 @@ exit 45
         assert!(!create_a.contains("--userns=keep-id"));
         assert!(create_a.contains("--cap-drop=ALL"));
         assert!(create_a.contains("--security-opt=no-new-privileges"));
+        assert!(create_a.contains("/usr/bin/tini\t--\tsleep\tinfinity"));
         assert!(create_a.contains(&format!(
             "{}:{}:rw",
             workspace_a.display(),

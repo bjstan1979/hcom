@@ -463,25 +463,51 @@ fn seed_workspace_pi_credentials(pi_state: &Path) -> Result<()> {
         .or_else(|| dirs::home_dir().map(|home| home.join(".pi/agent")))
         .ok_or_else(|| anyhow::anyhow!("Cannot resolve host Pi state directory"))?;
     for name in ["auth.json", "models.json"] {
-        let source = host_pi.join(name);
-        let destination = pi_state.join(name);
-        if !source.is_file() {
-            continue;
+        sync_newer_private_file(&host_pi.join(name), &pi_state.join(name))?;
+    }
+
+    let host_credentials = host_pi.join("credentials");
+    if host_credentials.is_dir() {
+        let sandbox_credentials = pi_state.join("credentials");
+        ensure_private_dir(&sandbox_credentials)?;
+        for entry in fs::read_dir(&host_credentials).with_context(|| {
+            format!(
+                "Failed to read host Pi credentials {}",
+                host_credentials.display()
+            )
+        })? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let source = entry.path();
+            // Provider credentials are flat regular Markdown files. Refuse
+            // symlinks and nested trees so this sync cannot become an
+            // arbitrary host-file copier.
+            if !file_type.is_file() || source.extension().and_then(|ext| ext.to_str()) != Some("md")
+            {
+                continue;
+            }
+            sync_newer_private_file(&source, &sandbox_credentials.join(entry.file_name()))?;
         }
-        // Workspace credentials are private copies, not mounts. Refresh only
-        // when the host copy is newer, so an explicit host /login reaches an
-        // existing persistent sandbox without overwriting credentials changed
-        // inside the sandbox or touching session state.
-        let host_updated = match (source.metadata()?.modified(), destination.metadata()) {
-            (Ok(source_time), Ok(destination_meta)) => match destination_meta.modified() {
-                Ok(destination_time) => source_time > destination_time,
-                Err(_) => true,
-            },
-            _ => true,
-        };
-        if host_updated {
-            copy_private_file(&source, &destination)?;
-        }
+    }
+    Ok(())
+}
+
+fn sync_newer_private_file(source: &Path, destination: &Path) -> Result<()> {
+    if !source.is_file() {
+        return Ok(());
+    }
+    // Workspace credentials are private copies, not mounts. Refresh only when
+    // the host copy is newer, so host login/config updates reach an existing
+    // persistent sandbox without overwriting newer sandbox-local changes.
+    let host_updated = match (source.metadata()?.modified(), destination.metadata()) {
+        (Ok(source_time), Ok(destination_meta)) => match destination_meta.modified() {
+            Ok(destination_time) => source_time > destination_time,
+            Err(_) => true,
+        },
+        _ => true,
+    };
+    if host_updated {
+        copy_private_file(source, destination)?;
     }
     Ok(())
 }
@@ -914,6 +940,14 @@ exit 45
         fs::write(&mmx_socket, "socket placeholder").unwrap();
         fs::write(pi.join("auth.json"), "host-auth").unwrap();
         fs::write(pi.join("models.json"), "host-models").unwrap();
+        fs::create_dir_all(pi.join("credentials")).unwrap();
+        fs::write(pi.join("credentials/provider.md"), "host-provider-key").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            pi.join("auth.json"),
+            pi.join("credentials/refused-symlink.md"),
+        )
+        .unwrap();
         let bin = fake_podman(temp.path());
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
         let vars = [
@@ -1063,6 +1097,23 @@ exit 45
             b"host-models"
         );
         assert_eq!(
+            fs::read(root.join("pi-agent/credentials/provider.md")).unwrap(),
+            b"host-provider-key"
+        );
+        assert!(
+            !root
+                .join("pi-agent/credentials/refused-symlink.md")
+                .exists()
+        );
+        assert_eq!(
+            fs::metadata(root.join("pi-agent/credentials/provider.md"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
             fs::metadata(root.join("pi-agent/auth.json"))
                 .unwrap()
                 .permissions()
@@ -1071,20 +1122,34 @@ exit 45
             0o600
         );
         fs::write(root.join("pi-agent/auth.json"), "workspace-auth").unwrap();
+        fs::write(
+            root.join("pi-agent/credentials/provider.md"),
+            "workspace-provider-key",
+        )
+        .unwrap();
         unsafe { std::env::set_var(ROOT_ENV, &workspace_a) };
         wrap_worker_command("pi".into(), vec![], Some("three")).unwrap();
         assert_eq!(
             fs::read(root.join("pi-agent/auth.json")).unwrap(),
             b"workspace-auth"
         );
+        assert_eq!(
+            fs::read(root.join("pi-agent/credentials/provider.md")).unwrap(),
+            b"workspace-provider-key"
+        );
         // A later host /login is propagated on the next worker start without
         // mounting the host credential file into the container.
         std::thread::sleep(std::time::Duration::from_millis(2));
         fs::write(pi.join("auth.json"), "new-host-auth").unwrap();
+        fs::write(pi.join("credentials/provider.md"), "new-host-provider-key").unwrap();
         wrap_worker_command("pi".into(), vec![], Some("four")).unwrap();
         assert_eq!(
             fs::read(root.join("pi-agent/auth.json")).unwrap(),
             b"new-host-auth"
+        );
+        assert_eq!(
+            fs::read(root.join("pi-agent/credentials/provider.md")).unwrap(),
+            b"new-host-provider-key"
         );
         for path in [
             root.clone(),

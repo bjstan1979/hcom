@@ -221,12 +221,9 @@ fn kv_store_sub(db: &HcomDb, key: &str, sub: &serde_json::Value) {
     }
 }
 
-/// Clear agy grace timers when the target is working again (deliver/tool/active).
-fn clear_agy_reqwatch_idle_grace(db: &HcomDb, target: &str) {
+/// Clear reqwatch grace timers when the target is working again (deliver/tool/active).
+fn clear_reqwatch_idle_grace(db: &HcomDb, target: &str) {
     for (key, sub, filters) in load_reqwatch_subs(db) {
-        if filters.get("target_tool").and_then(|v| v.as_str()) != Some("antigravity") {
-            continue;
-        }
         if filters.get("target").and_then(|v| v.as_str()) != Some(target) {
             continue;
         }
@@ -242,14 +239,12 @@ fn clear_agy_reqwatch_idle_grace(db: &HcomDb, target: &str) {
     }
 }
 
-/// Fire Antigravity request watches whose idle grace elapsed while no matching
+/// Fire request watches whose idle grace elapsed while no matching
 /// event arrived. The conditional delete is the claim: concurrent sweepers can
 /// observe the same row, but only one can remove it and emit the one-shot notice.
 fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
     for (key, sub, filters) in load_reqwatch_subs(db) {
-        if filters.get("target_tool").and_then(|v| v.as_str()) != Some("antigravity")
-            || !super::reqwatch_policy::idle_grace_expired(&sub, now)
-        {
+        if !super::reqwatch_policy::idle_grace_expired(&sub, now) {
             continue;
         }
 
@@ -280,7 +275,6 @@ fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
                 "DELETE FROM kv
                  WHERE key = ?1
                    AND CAST(json_extract(value, '$.idle_grace_until') AS REAL) <= ?2
-                   AND json_extract(value, '$.filters.target_tool') = 'antigravity'
                    AND EXISTS (
                        SELECT 1 FROM instances
                        WHERE name = ?3 AND status = 'listening' AND last_event_id >= ?4
@@ -519,11 +513,11 @@ pub(crate) fn process_logged_event(
         }
     }
 
-    // agy: turn-end `listening` is normal; reset reqwatch grace when target is active again.
+    // turn-end `listening` is normal; reset reqwatch grace when target is active again.
     if event_type == "status" {
         let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status == "active" || status == "blocked" {
-            clear_agy_reqwatch_idle_grace(db, instance);
+            clear_reqwatch_idle_grace(db, instance);
         }
     }
 
@@ -1279,9 +1273,9 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_reqwatch_listening_notifies_without_grace() {
+    fn test_gemini_reqwatch_listening_defers_with_grace() {
         let (db, db_path) = setup_full_test_db();
-        setup_reqwatch_pair(&db, "gora", "nova", "gemini");
+        let request_id = setup_reqwatch_pair(&db, "gora", "nova", "gemini");
         let before = count_reqwatch_without_reply_notifications(&db, "gora");
 
         let data = serde_json::json!({"status": "listening", "context": ""});
@@ -1289,16 +1283,23 @@ mod tests {
 
         assert_eq!(
             count_reqwatch_without_reply_notifications(&db, "gora"),
-            before + 1,
-            "non-agy listening should notify immediately"
+            before,
+            "gemini listening should defer reqwatch notification with grace"
         );
+        let sub_raw = db
+            .kv_get(&format!("events_sub:reqwatch-{request_id}-nova"))
+            .unwrap()
+            .unwrap();
+        let sub: serde_json::Value = serde_json::from_str(&sub_raw).unwrap();
+        assert!(sub.get("idle_grace_until").is_some());
         cleanup_test_db(db_path);
     }
 
     #[test]
-    fn test_pi_reqwatch_notifies_after_delivery_active_then_listening() {
+    fn test_pi_reqwatch_defers_on_listening_and_notifies_after_sweep() {
         let (db, db_path) = setup_full_test_db();
-        setup_reqwatch_pair(&db, "gora", "nabe", "pi");
+        let request_id = setup_reqwatch_pair(&db, "gora", "nabe", "pi");
+        let sub_key = format!("events_sub:reqwatch-{request_id}-nabe");
         let before = count_reqwatch_without_reply_notifications(&db, "gora");
 
         db.log_event(
@@ -1313,6 +1314,7 @@ mod tests {
             "delivery active edge should not notify yet"
         );
 
+        db.set_status("nabe", "listening", "").unwrap();
         db.log_event(
             "status",
             "nabe",
@@ -1321,8 +1323,20 @@ mod tests {
         .unwrap();
         assert_eq!(
             count_reqwatch_without_reply_notifications(&db, "gora"),
+            before,
+            "pi listening should defer reqwatch notification"
+        );
+
+        let mut sub: serde_json::Value =
+            serde_json::from_str(&db.kv_get(&sub_key).unwrap().unwrap()).unwrap();
+        sub["idle_grace_until"] = serde_json::json!(1.0);
+        kv_store_sub(&db, &sub_key, &sub);
+
+        sweep_expired_reqwatch_graces(&db, 2.0);
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
             before + 1,
-            "pi listening after delivery should notify"
+            "pi should notify after grace expires"
         );
         cleanup_test_db(db_path);
     }

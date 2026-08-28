@@ -2,12 +2,13 @@
 
 use serde_json::Value;
 
-/// After agy reports `listening`, wait before "idle without reply" (seconds).
+/// After an agent reports `listening`, wait before "idle without reply" (seconds).
 ///
 /// Per idle spell only — reset when the target goes `active`/`blocked` again.
-pub(crate) const AGY_REQWATCH_IDLE_GRACE_SEC: f64 = 10.0;
+pub(crate) const REQWATCH_IDLE_GRACE_SEC: f64 = 10.0;
+pub(crate) const AGY_REQWATCH_IDLE_GRACE_SEC: f64 = REQWATCH_IDLE_GRACE_SEC;
 
-/// Whether a stored Antigravity idle grace is ready for timer/sweep handling.
+/// Whether a stored idle grace is ready for timer/sweep handling.
 pub(crate) fn idle_grace_expired(sub: &Value, now: f64) -> bool {
     sub.get("idle_grace_until")
         .and_then(|v| v.as_f64())
@@ -21,22 +22,18 @@ pub(crate) enum ReqwatchNotifyDecision {
     Defer { set_grace_if_absent: bool },
     /// Proceed to notify the request watcher.
     Proceed,
-    /// Ignore this event for reqwatch (agy non-listening/non-stopped).
+    /// Ignore this event for reqwatch (non-listening/non-stopped).
     Skip,
 }
 
-/// Tool-specific reqwatch gating for a single subscription match.
+/// Reqwatch gating for a single subscription match.
 pub(crate) fn reqwatch_notify_decision(
-    target_tool: &str,
+    _target_tool: &str,
     event_type: &str,
     data: &Value,
     sub: &Value,
     now: f64,
 ) -> ReqwatchNotifyDecision {
-    if target_tool != "antigravity" {
-        return ReqwatchNotifyDecision::Proceed;
-    }
-
     let is_listening =
         event_type == "status" && data.get("status").and_then(|v| v.as_str()) == Some("listening");
     let is_stopped =
@@ -70,19 +67,21 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_non_antigravity_proceeds_immediately() {
+    fn test_listening_defers_and_sets_grace() {
         let sub = json!({});
         let data = json!({"status": "listening"});
         assert_eq!(
-            reqwatch_notify_decision("gemini", "status", &data, &sub, 0.0),
-            ReqwatchNotifyDecision::Proceed
+            reqwatch_notify_decision("gemini", "status", &data, &sub, 100.0),
+            ReqwatchNotifyDecision::Defer {
+                set_grace_if_absent: true
+            }
         );
-    }
-
-    #[test]
-    fn test_agy_listening_defers_and_sets_grace() {
-        let sub = json!({});
-        let data = json!({"status": "listening"});
+        assert_eq!(
+            reqwatch_notify_decision("pi", "status", &data, &sub, 100.0),
+            ReqwatchNotifyDecision::Defer {
+                set_grace_if_absent: true
+            }
+        );
         assert_eq!(
             reqwatch_notify_decision("antigravity", "status", &data, &sub, 100.0),
             ReqwatchNotifyDecision::Defer {
@@ -92,9 +91,13 @@ mod tests {
     }
 
     #[test]
-    fn test_agy_listening_proceeds_after_grace_expired() {
+    fn test_listening_proceeds_after_grace_expired() {
         let sub = json!({"idle_grace_until": 50.0});
         let data = json!({"status": "listening"});
+        assert_eq!(
+            reqwatch_notify_decision("pi", "status", &data, &sub, 100.0),
+            ReqwatchNotifyDecision::Proceed
+        );
         assert_eq!(
             reqwatch_notify_decision("antigravity", "status", &data, &sub, 100.0),
             ReqwatchNotifyDecision::Proceed
@@ -102,9 +105,13 @@ mod tests {
     }
 
     #[test]
-    fn test_agy_active_status_skipped() {
+    fn test_active_status_skipped() {
         let sub = json!({});
         let data = json!({"status": "active"});
+        assert_eq!(
+            reqwatch_notify_decision("pi", "status", &data, &sub, 0.0),
+            ReqwatchNotifyDecision::Skip
+        );
         assert_eq!(
             reqwatch_notify_decision("antigravity", "status", &data, &sub, 0.0),
             ReqwatchNotifyDecision::Skip

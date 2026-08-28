@@ -18,7 +18,7 @@ RUN if ! getent group "${PI_GID}" >/dev/null; then groupadd --gid "${PI_GID}" pi
  && chown -R "${PI_UID}:${PI_GID}" /home/pi
 
 COPY rootfs/ /
-RUN chmod 0755 /usr/local/bin/hcom /usr/local/bin/pi /usr/local/bin/pi-container-entry \
+RUN chmod 0755 /usr/local/bin/hcom /usr/local/bin/pi /usr/local/bin/pi-container-entry /usr/local/bin/flowus \
  && chown -R "${PI_UID}:${PI_GID}" /home/pi /opt/pi-agent-seed
 
 ENV HOME=/home/pi \

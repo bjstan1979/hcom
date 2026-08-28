@@ -396,6 +396,7 @@ where
         "AGENTMEMORY_SOCKET",
         "ANYSEARCH_SOCKET",
         "MMX_SOCKET",
+        "FLOWUS_SOCKET",
     ] {
         if let Ok(value) = std::env::var(key)
             && !value.is_empty()

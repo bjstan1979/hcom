@@ -17,6 +17,7 @@ out=$1
 hcom_bin=${HCOM_BIN:-$(command -v hcom || true)}
 pi_bin=$(command -v pi || true)
 pi_dir=${PI_CODING_AGENT_DIR:-${HOME:?}/.pi/agent}
+skills_dir=${PI_SKILLS_DIR:-${HOME:?}/.agents/skills}
 [[ -x "$hcom_bin" ]] || { echo "hcom executable not found" >&2; exit 1; }
 [[ -n "$pi_bin" ]] || { echo "pi executable not found" >&2; exit 1; }
 pi_real=$(readlink -f "$pi_bin")
@@ -32,6 +33,7 @@ rm -rf "$out"
 mkdir -p "$out/rootfs/usr/local/bin" "$out/rootfs/usr/local/lib" "$out/rootfs/home/pi/.pi/agent"
 cp "$(dirname "$0")/Containerfile" "$out/Containerfile"
 cp -L "$hcom_bin" "$out/rootfs/usr/local/bin/hcom"
+cp "$(dirname "$0")/flowus-sandbox-shim.py" "$out/rootfs/usr/local/bin/flowus"
 cp -a "$pi_package" "$out/rootfs/usr/local/lib/pi-coding-agent"
 cat > "$out/rootfs/usr/local/bin/pi" <<'EOF'
 #!/bin/sh
@@ -43,7 +45,7 @@ set -eu
 seed=/opt/pi-agent-seed
 runtime=${PI_CODING_AGENT_DIR:?}
 mkdir -p "$runtime"
-for entry in extensions agents npm; do
+for entry in extensions agents npm skills; do
   if [ ! -e "$runtime/$entry" ] && [ -e "$seed/$entry" ]; then
     mkdir -p "$runtime/$entry"
     cp -R --no-preserve=ownership "$seed/$entry/." "$runtime/$entry/"
@@ -72,12 +74,26 @@ for extension in anysearch.ts mmx.ts; do
     cp --no-preserve=ownership "$seed/extensions/$extension" "$runtime/extensions/$extension"
   fi
 done
+for skill in flowus-cli flowus-markdown-upload; do
+  if [ -d "$seed/skills/$skill" ]; then
+    mkdir -p "$runtime/skills"
+    rm -rf "$runtime/skills/$skill"
+    cp -R --no-preserve=ownership "$seed/skills/$skill" "$runtime/skills/$skill"
+  fi
+done
 exec /usr/local/bin/pi "$@"
 EOF
-chmod 0755 "$out/rootfs/usr/local/bin/pi" "$out/rootfs/usr/local/bin/pi-container-entry"
+chmod 0755 "$out/rootfs/usr/local/bin/pi" "$out/rootfs/usr/local/bin/pi-container-entry" \
+  "$out/rootfs/usr/local/bin/flowus"
 mkdir -p "$out/rootfs/opt/pi-agent-seed"
 for entry in extensions agents npm settings.json APPEND_SYSTEM.md schedule-prompts-settings.json; do
   [[ -e "$pi_dir/$entry" ]] && cp -a "$pi_dir/$entry" "$out/rootfs/opt/pi-agent-seed/$entry"
+done
+for skill in flowus-cli flowus-markdown-upload; do
+  if [[ -d "$skills_dir/$skill" ]]; then
+    mkdir -p "$out/rootfs/opt/pi-agent-seed/skills"
+    cp -a "$skills_dir/$skill" "$out/rootfs/opt/pi-agent-seed/skills/$skill"
+  fi
 done
 find "$out/rootfs/opt/pi-agent-seed" -type d -name .git -prune -exec rm -rf {} +
 

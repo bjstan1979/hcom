@@ -23,6 +23,7 @@ const PODMAN_CPUS_ENV: &str = "HCOM_PODMAN_CPUS";
 const AGENTMEMORY_SOCKET_ENV: &str = "AGENTMEMORY_SOCKET";
 const ANYSEARCH_SOCKET_ENV: &str = "ANYSEARCH_SOCKET";
 const MMX_SOCKET_ENV: &str = "MMX_SOCKET";
+const FLOWUS_SOCKET_ENV: &str = "FLOWUS_SOCKET";
 const DEFAULT_PODMAN_IMAGE: &str = "localhost/hcom-pi-workspace:live";
 
 pub struct WorkerCommand {
@@ -292,7 +293,12 @@ fn build_podman_workspace_command(
             ] {
                 create.extend(["--volume".into(), mount]);
             }
-            for env_name in [AGENTMEMORY_SOCKET_ENV, ANYSEARCH_SOCKET_ENV, MMX_SOCKET_ENV] {
+            for env_name in [
+                AGENTMEMORY_SOCKET_ENV,
+                ANYSEARCH_SOCKET_ENV,
+                MMX_SOCKET_ENV,
+                FLOWUS_SOCKET_ENV,
+            ] {
                 if let Some(socket) = env_nonempty(env_name).map(PathBuf::from) {
                     if !socket.is_absolute() || !socket.exists() {
                         bail!("{env_name} must be an existing absolute path");
@@ -396,6 +402,7 @@ fn build_podman_workspace_command(
         AGENTMEMORY_SOCKET_ENV,
         ANYSEARCH_SOCKET_ENV,
         MMX_SOCKET_ENV,
+        FLOWUS_SOCKET_ENV,
     ] {
         args.extend(["--env".into(), name.into()]);
     }
@@ -934,6 +941,8 @@ exit 45
         let broker_token = temp.path().join("broker.token");
         let mmx_bridge = temp.path().join("mmx-bridge");
         let mmx_socket = mmx_bridge.join("mmx.sock");
+        let flowus_bridge = temp.path().join("flowus-bridge");
+        let flowus_socket = flowus_bridge.join("flowus.sock");
         for path in [
             &home,
             &hcom,
@@ -942,12 +951,14 @@ exit 45
             &workspace_b,
             &state,
             &mmx_bridge,
+            &flowus_bridge,
         ] {
             fs::create_dir_all(path).unwrap();
         }
         fs::write(&broker_socket, "socket placeholder").unwrap();
         fs::write(&broker_token, "token").unwrap();
         fs::write(&mmx_socket, "socket placeholder").unwrap();
+        fs::write(&flowus_socket, "socket placeholder").unwrap();
         fs::write(pi.join("auth.json"), "host-auth").unwrap();
         fs::write(pi.join("models.json"), "host-models").unwrap();
         fs::create_dir_all(pi.join("credentials")).unwrap();
@@ -973,6 +984,7 @@ exit 45
             ("HCOM_BROKER_SOCKET", Some(broker_socket.as_os_str())),
             ("HCOM_BROKER_TOKEN_FILE", Some(broker_token.as_os_str())),
             (MMX_SOCKET_ENV, Some(mmx_socket.as_os_str())),
+            (FLOWUS_SOCKET_ENV, Some(flowus_socket.as_os_str())),
         ];
         let _vars = VarGuard::set(&vars);
 
@@ -1030,6 +1042,7 @@ exit 45
             "HCOM_BROKER_SOCKET",
             "HCOM_BROKER_TOKEN_FILE",
             MMX_SOCKET_ENV,
+            FLOWUS_SOCKET_ENV,
         ] {
             assert!(first.args.windows(2).any(|w| w == ["--env", env]));
         }
@@ -1088,6 +1101,16 @@ exit 45
             "{}:{}:rw",
             mmx_bridge.display(),
             mmx_bridge.display()
+        )));
+        assert!(create_a.contains(&format!(
+            "{}:{}:ro",
+            flowus_bridge.display(),
+            flowus_bridge.display()
+        )));
+        assert!(!create_a.contains(&format!(
+            "{}:{}:rw",
+            flowus_bridge.display(),
+            flowus_bridge.display()
         )));
         assert!(!create_a.contains("hcom.db"));
         assert!(!create_a.contains("control.key"));

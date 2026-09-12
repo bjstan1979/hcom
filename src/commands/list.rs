@@ -56,8 +56,22 @@ pub struct ListArgs {
 fn get_unread_count(db: &HcomDb, name: &str, last_event_id: i64) -> i64 {
     db.conn()
         .query_row(
-            "SELECT COUNT(*) FROM events WHERE id > ? AND type = 'message'
-             AND EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.delivered_to')) WHERE value = ?)",
+            "SELECT COUNT(*) FROM events WHERE id > ?1 AND type = 'message'
+             AND EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.delivered_to')) WHERE value = ?2)
+             AND (
+                 json_extract(data, '$.message_id') IS NULL
+                 OR NOT EXISTS (
+                     SELECT 1 FROM message_records mr
+                     WHERE mr.message_id = json_extract(data, '$.message_id')
+                 )
+                 OR EXISTS (
+                     SELECT 1 FROM message_deliveries md
+                     WHERE md.message_id = json_extract(data, '$.message_id')
+                       AND md.recipient_name = ?2
+                       AND md.delivery_endpoint = 'inbox'
+                       AND md.state NOT IN ('cancelled', 'superseded', 'delivery_failed')
+                 )
+             )",
             rusqlite::params![last_event_id, name],
             |row| row.get(0),
         )
@@ -157,6 +171,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     "parent_name": data.parent_name,
                     "agent_id": data.agent_id,
                     "tool": data.tool,
+                    "endpoint_epoch": data.endpoint_epoch,
+                    "presence": serde_json::from_str::<serde_json::Value>(&data.presence_json).unwrap_or_else(|_| serde_json::json!({})),
+                    "features": crate::db::MESSAGE_FEATURES,
                 });
 
                 if is_self
@@ -262,6 +279,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 "hooks_bound": hooks_bound,
                 "process_bound": process_bound,
                 "launch_context": launch_context,
+                "endpoint_epoch": data.endpoint_epoch,
+                "presence": serde_json::from_str::<serde_json::Value>(&data.presence_json).unwrap_or_else(|_| serde_json::json!({})),
+                "features": crate::db::MESSAGE_FEATURES,
             });
             result_list.push(payload);
         }

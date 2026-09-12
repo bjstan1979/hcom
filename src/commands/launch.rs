@@ -17,7 +17,9 @@ use anyhow::{Result, bail};
 use serde_json::json;
 use std::time::Instant;
 
-pub(crate) const INLINE_SINGLE_LAUNCH_WAIT_SECS: u64 = 10;
+// Match `hcom events launch` so a normal cold plugin startup is not reported as
+// a failed command just before it becomes ready.
+pub(crate) const INLINE_SINGLE_LAUNCH_WAIT_SECS: u64 = 30;
 
 /// Run the launch command. `argv` is the full argv[1..] including count/tool.
 pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {

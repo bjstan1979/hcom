@@ -82,12 +82,13 @@ fn claude_children_for_session(txn: &Transaction<'_>, session_id: &str) -> Resul
 }
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 
 #[cfg(test)]
-static TEST_MIGRATE_NOTIFY_FAIL: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-static TEST_BIND_SESSION_PROCESS_FAIL: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static TEST_MIGRATE_NOTIFY_FAIL: Cell<bool> = const { Cell::new(false) };
+    static TEST_BIND_SESSION_PROCESS_FAIL: Cell<bool> = const { Cell::new(false) };
+}
 
 impl HcomDb {
     /// Delete process binding (for cleanup)
@@ -163,7 +164,7 @@ impl HcomDb {
         }
 
         #[cfg(test)]
-        if TEST_MIGRATE_NOTIFY_FAIL.load(Ordering::SeqCst) {
+        if TEST_MIGRATE_NOTIFY_FAIL.with(Cell::get) {
             return Err(anyhow::anyhow!("test_injected_migrate_notify_fail"));
         }
 
@@ -414,7 +415,7 @@ impl HcomDb {
             bail!("cannot bind missing instance {instance_name}");
         }
         #[cfg(test)]
-        if TEST_BIND_SESSION_PROCESS_FAIL.load(Ordering::SeqCst) {
+        if TEST_BIND_SESSION_PROCESS_FAIL.with(Cell::get) {
             bail!("test_injected_bind_session_process_fail");
         }
 
@@ -739,11 +740,11 @@ impl HcomDb {
 #[cfg(test)]
 impl HcomDb {
     pub fn set_test_migrate_notify_fail(fail: bool) {
-        TEST_MIGRATE_NOTIFY_FAIL.store(fail, Ordering::SeqCst);
+        TEST_MIGRATE_NOTIFY_FAIL.with(|flag| flag.set(fail));
     }
 
     pub fn set_test_bind_session_process_fail(fail: bool) {
-        TEST_BIND_SESSION_PROCESS_FAIL.store(fail, Ordering::SeqCst);
+        TEST_BIND_SESSION_PROCESS_FAIL.with(|flag| flag.set(fail));
     }
 }
 

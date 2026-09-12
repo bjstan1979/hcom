@@ -59,8 +59,329 @@ fn help_prints_and_exits_zero() {
         stdout.contains("Commands:") || stdout.contains("Launch:"),
         "stdout={stdout}"
     );
+    assert!(stdout.contains("\nmessage      "), "stdout={stdout}");
 }
 
+#[test]
+fn message_help_is_reachable_through_outer_router() {
+    let h = Hcom::new();
+    let (code, stdout, stderr) = h.run(["message", "--help"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("message pending"), "stdout={stdout}");
+    assert!(stdout.contains("message receipt"), "stdout={stdout}");
+    assert!(stdout.contains("message-uuid|event-id"), "stdout={stdout}");
+    assert!(
+        stdout.contains("one JSON object, never an array"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("hcom --name done message reply"),
+        "stdout={stdout}"
+    );
+
+    let (events_code, _events_stdout, events_stderr) = h.run(["events", "--json", "--last", "1"]);
+    assert_eq!(events_code, 0, "stderr={events_stderr}");
+}
+
+#[test]
+fn machine_and_quiet_routes_leave_queued_unread_cursor_unchanged() {
+    let h = Hcom::new();
+    let sender_process_id = "machine-output-sender";
+    let sender = start_bound(&h, sender_process_id);
+    let process_id = "machine-output-recipient";
+    let recipient = start_bound(&h, process_id);
+    let db_path = h.hcom_dir.join("hcom.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE instances SET tool = 'adhoc' WHERE name = ?1",
+        [&recipient],
+    )
+    .unwrap();
+    drop(conn);
+
+    let target = format!("@{recipient}");
+    let (request_code, request_stdout, request_stderr) = h.run([
+        "send",
+        target.as_str(),
+        "--name",
+        sender.as_str(),
+        "--intent",
+        "request",
+        "--json",
+        "--",
+        "request awaiting machine reply",
+    ]);
+    assert_eq!(
+        request_code, 0,
+        "stdout={request_stdout} stderr={request_stderr}"
+    );
+    let request: serde_json::Value = serde_json::from_str(request_stdout.trim()).unwrap();
+    let request_id = request["message_id"].as_str().unwrap().to_string();
+    let request_event_id = request["event_id"].as_i64().unwrap().to_string();
+    let (inspect_code, inspect_stdout, inspect_stderr) = h.run_as_process(
+        process_id,
+        ["message", "inspect", request_event_id.as_str(), "--json"],
+    );
+    assert_eq!(
+        inspect_code, 0,
+        "stdout={inspect_stdout} stderr={inspect_stderr}"
+    );
+    let inspection: serde_json::Value = serde_json::from_str(inspect_stdout.trim()).unwrap();
+    assert_eq!(inspection["message"]["message_id"], request_id);
+    let (queued_code, _, queued_stderr) = h.run([
+        "send",
+        target.as_str(),
+        "--name",
+        sender.as_str(),
+        "--intent",
+        "inform",
+        "--json",
+        "--",
+        "queued unread sentinel",
+    ]);
+    assert_eq!(queued_code, 0, "stderr={queued_stderr}");
+
+    let read_cursor = || -> i64 {
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(last_event_id, 0) FROM instances WHERE name = ?1",
+                [&recipient],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let cursor_before = read_cursor();
+
+    let (reply_code, reply_stdout, reply_stderr) = h.run_as_process(
+        process_id,
+        [
+            "message",
+            "reply",
+            request_event_id.as_str(),
+            "--json",
+            "--quiet",
+            "--",
+            "machine reply",
+        ],
+    );
+    assert_eq!(reply_code, 0, "stdout={reply_stdout} stderr={reply_stderr}");
+    let reply: serde_json::Value = serde_json::from_str(reply_stdout.trim()).unwrap();
+    let reply_id = reply["message_id"].as_str().unwrap();
+    assert!(reply["message_id"].is_string(), "stdout={reply_stdout}");
+    let (reply_inspect_code, reply_inspect_stdout, reply_inspect_stderr) = h.run_as_process(
+        sender_process_id,
+        ["message", "inspect", reply_id, "--json"],
+    );
+    assert_eq!(
+        reply_inspect_code, 0,
+        "stdout={reply_inspect_stdout} stderr={reply_inspect_stderr}"
+    );
+    let reply_inspection: serde_json::Value =
+        serde_json::from_str(reply_inspect_stdout.trim()).unwrap();
+    assert_eq!(
+        reply_inspection["deliveries"][0]["delivery_endpoint"], "inbox",
+        "ordinary request replies must preserve upstream wake/inbox delivery"
+    );
+    let (sender_read_code, sender_read_stdout, sender_read_stderr) =
+        h.run_as_process(sender_process_id, ["pi-read"]);
+    assert_eq!(sender_read_code, 0, "stderr={sender_read_stderr}");
+    let sender_unread: serde_json::Value = serde_json::from_str(&sender_read_stdout).unwrap();
+    assert!(
+        sender_unread
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["message_id"] == reply_id)),
+        "reply must be visible to sender inbox: {sender_read_stdout}"
+    );
+    assert!(!reply_stdout.contains("queued unread sentinel"));
+    assert_eq!(read_cursor(), cursor_before);
+
+    let sender_target = format!("@{sender}");
+    let (json_code, json_stdout, json_stderr) = h.run_as_process(
+        process_id,
+        [
+            "send",
+            "--json",
+            "--quiet",
+            sender_target.as_str(),
+            "--",
+            "json wins",
+        ],
+    );
+    assert_eq!(json_code, 0, "stdout={json_stdout} stderr={json_stderr}");
+    let json_send: serde_json::Value = serde_json::from_str(json_stdout.trim()).unwrap();
+    assert!(json_send["message_id"].is_string(), "stdout={json_stdout}");
+    assert!(!json_stdout.contains("queued unread sentinel"));
+    assert_eq!(read_cursor(), cursor_before);
+
+    let (quiet_code, quiet_stdout, quiet_stderr) = h.run_as_process(
+        process_id,
+        [
+            "send",
+            "--quiet",
+            sender_target.as_str(),
+            "--",
+            "quiet send",
+        ],
+    );
+    assert_eq!(quiet_code, 0, "stdout={quiet_stdout} stderr={quiet_stderr}");
+    assert!(quiet_stdout.trim().is_empty(), "stdout={quiet_stdout}");
+    assert_eq!(read_cursor(), cursor_before);
+}
+
+#[test]
+fn explicit_wait_reply_mode_is_exclusive_and_not_injected() {
+    let h = Hcom::new();
+    let sender_process_id = "wait-mode-sender";
+    let recipient_process_id = "wait-mode-recipient";
+    let sender = start_bound(&h, sender_process_id);
+    let recipient = start_bound(&h, recipient_process_id);
+    let target = format!("@{recipient}");
+
+    let (send_code, send_stdout, send_stderr) = h.run_as_process(
+        sender_process_id,
+        [
+            "send",
+            target.as_str(),
+            "--intent",
+            "request",
+            "--reply-mode",
+            "wait",
+            "--json",
+            "--",
+            "exclusive wait request",
+        ],
+    );
+    assert_eq!(send_code, 0, "stdout={send_stdout} stderr={send_stderr}");
+    let request: serde_json::Value = serde_json::from_str(send_stdout.trim()).unwrap();
+    let request_id = request["message_id"].as_str().unwrap();
+
+    let (reply_code, reply_stdout, reply_stderr) = h.run_as_process(
+        recipient_process_id,
+        [
+            "message",
+            "reply",
+            request_id,
+            "--json",
+            "--",
+            "exclusive waiter reply",
+        ],
+    );
+    assert_eq!(reply_code, 0, "stdout={reply_stdout} stderr={reply_stderr}");
+    let reply: serde_json::Value = serde_json::from_str(reply_stdout.trim()).unwrap();
+    let reply_id = reply["message_id"].as_str().unwrap();
+
+    let (read_code, read_stdout, read_stderr) = h.run_as_process(sender_process_id, ["pi-read"]);
+    assert_eq!(read_code, 0, "stderr={read_stderr}");
+    let unread: serde_json::Value = serde_json::from_str(&read_stdout).unwrap();
+    assert!(
+        unread
+            .as_array()
+            .is_some_and(|rows| rows.iter().all(|row| row["message_id"] != reply_id)),
+        "exclusive waiter reply leaked into inbox for {sender}: {read_stdout}"
+    );
+
+    let (wait_code, wait_stdout, wait_stderr) = h.run_as_process(
+        sender_process_id,
+        ["message", "wait", request_id, "--timeout", "1", "--json"],
+    );
+    assert_eq!(wait_code, 0, "stdout={wait_stdout} stderr={wait_stderr}");
+    let waited: serde_json::Value = serde_json::from_str(wait_stdout.trim()).unwrap();
+    assert_eq!(waited["message"]["message_id"], reply_id);
+    assert_eq!(waited["deliveries"][0]["state"], "acknowledged");
+}
+
+fn start_bound(h: &Hcom, process_id: &str) -> String {
+    let mut start = h.cmd();
+    start.env("HCOM_PROCESS_ID", process_id).arg("start");
+    let output = start.output().expect("spawn bound hcom start");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    parse_hcom_marker(&stdout).expect("bound instance marker")
+}
+
+#[test]
+fn verified_process_cannot_impersonate_another_instance_on_advanced_commands() {
+    let h = Hcom::new();
+    let alice = start_bound(&h, "verified-alice");
+    let bob = start_bound(&h, "verified-bob");
+
+    for args in [
+        vec!["message", "pending", "--name", bob.as_str(), "--json"],
+        vec!["pi-read", "--name", bob.as_str()],
+        vec!["pi-status", "--name", bob.as_str(), "--status", "listening"],
+        vec!["pi-stop", "--name", bob.as_str(), "--reason", "spoof"],
+        vec!["status", "--name", bob.as_str(), "--presence", "{}"],
+    ] {
+        let mut command = h.cmd();
+        command.env("HCOM_PROCESS_ID", "verified-alice").args(&args);
+        let output = command.output().expect("run spoof attempt");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        assert!(
+            !output.status.success(),
+            "Alice ({alice}) impersonated Bob ({bob}) with {args:?}: {combined}"
+        );
+        assert!(
+            combined.contains("conflicts with verified") || combined.contains("verified Pi actor"),
+            "unexpected rejection for {args:?}: {combined}"
+        );
+    }
+
+    let (_, list, _) = h.run(["list", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&list).unwrap();
+    assert!(rows.iter().any(|row| row["name"] == bob));
+}
+
+#[cfg(unix)]
+#[test]
+fn broker_forwarding_preserves_verified_identity_consistency() {
+    let h = Hcom::new();
+    let _alice = start_bound(&h, "broker-alice");
+    let bob = start_bound(&h, "broker-bob");
+    let socket = h.root.path().join("broker.sock");
+    let token_file = h.root.path().join("broker.token");
+    std::fs::write(&token_file, "test-broker-token\n").unwrap();
+
+    let mut server = h.cmd();
+    server.args([
+        "broker-serve",
+        "--socket",
+        socket.to_str().unwrap(),
+        "--token-file",
+        token_file.to_str().unwrap(),
+        "--workspace",
+        h.workspace.to_str().unwrap(),
+    ]);
+    let mut server = server.spawn().expect("spawn broker server");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !socket.exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(socket.exists(), "broker socket was not created");
+
+    let mut command = h.cmd();
+    command
+        .current_dir(&h.workspace)
+        .env("HCOM_PROCESS_ID", "broker-alice")
+        .env("HCOM_BROKER_SOCKET", &socket)
+        .env("HCOM_BROKER_TOKEN_FILE", &token_file)
+        .args(["pi-read", "--name", bob.as_str()]);
+    let output = command.output().expect("run broker spoof attempt");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        !output.status.success(),
+        "broker spoof succeeded: {combined}"
+    );
+    assert!(combined.contains("verified Pi actor"), "output={combined}");
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
 #[test]
 fn status_json_in_fresh_dir() {
     let h = Hcom::new();
@@ -1072,7 +1393,7 @@ fn pi_e2e_hook_dispatch() {
     let status = run_argv_hook(
         &h,
         "pi-status",
-        None,
+        Some(pid),
         &[
             "--name",
             &me,
@@ -1094,7 +1415,7 @@ fn pi_e2e_hook_dispatch() {
     let before_tool = run_argv_hook(
         &h,
         "pi-beforetool",
-        None,
+        Some(pid),
         &[
             "--name",
             &me,
@@ -1132,13 +1453,10 @@ fn pi_e2e_hook_dispatch() {
     ]);
     assert_eq!(send_code, 0, "send stderr={send_stderr}");
 
-    let check = h.run(["pi-read", "--name", &me, "--check"]);
-    assert_eq!(check.0, 0, "pi-read --check stderr={}", check.2);
-    assert_eq!(check.1.trim(), "true");
+    let check = run_argv_hook(&h, "pi-read", Some(pid), &["--name", &me, "--check"]);
+    assert_eq!(check, serde_json::json!(true));
 
-    let read = h.run(["pi-read", "--name", &me]);
-    assert_eq!(read.0, 0, "pi-read stderr={}", read.2);
-    let messages: serde_json::Value = serde_json::from_str(&read.1).expect("pi-read json");
+    let messages = run_argv_hook(&h, "pi-read", Some(pid), &["--name", &me]);
     assert!(
         messages
             .as_array()
@@ -1146,14 +1464,18 @@ fn pi_e2e_hook_dispatch() {
         "pi-read should return pending ping: {messages}"
     );
 
-    let ack = run_argv_hook(&h, "pi-read", None, &["--name", &me, "--ack"]);
+    let ack = run_argv_hook(&h, "pi-read", Some(pid), &["--name", &me, "--ack"]);
     assert_eq!(ack["acked"].as_u64(), Some(1));
-    let check = h.run(["pi-read", "--name", &me, "--check"]);
-    assert_eq!(check.0, 0, "pi-read --check after ack stderr={}", check.2);
-    assert_eq!(check.1.trim(), "false");
+    let check = run_argv_hook(&h, "pi-read", Some(pid), &["--name", &me, "--check"]);
+    assert_eq!(check, serde_json::json!(false));
 
     // 5. pi-stop finalizes the session.
-    let stop = run_argv_hook(&h, "pi-stop", None, &["--name", &me, "--reason", "done"]);
+    let stop = run_argv_hook(
+        &h,
+        "pi-stop",
+        Some(pid),
+        &["--name", &me, "--reason", "done"],
+    );
     assert_eq!(stop, serde_json::json!({ "ok": true }));
     let (code, stdout, _) = h.run([
         "events", "--agent", &me, "--action", "stopped", "--last", "5",

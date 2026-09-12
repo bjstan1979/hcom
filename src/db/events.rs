@@ -16,6 +16,15 @@ pub struct Message {
     pub timestamp: Option<String>,
     pub delivered_to: Option<Vec<String>>,
     pub bundle_id: Option<String>,
+    pub message_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub in_reply_to: Option<String>,
+    pub expects_reply: bool,
+    pub reply_endpoint: Option<String>,
+    pub delivery_endpoint: Option<String>,
+    pub supersedes: Option<String>,
+    pub retry_of: Option<String>,
+    pub attachments: Vec<crate::messages::MessageAttachment>,
     pub relay: bool,
 }
 
@@ -92,19 +101,36 @@ impl HcomDb {
                 continue;
             }
             if Self::should_deliver_to(&json, name) {
-                return true;
+                let visible = json
+                    .get("message_id")
+                    .and_then(|value| value.as_str())
+                    .and_then(|message_id| self.projected_inbox_delivery(message_id, name));
+                if visible != Some(false) {
+                    return true;
+                }
             }
         }
         false
     }
 
-    /// Get unread messages for an instance
-    ///
-    /// Returns messages where:
-    /// - event.id > instance.last_event_id
-    /// - event.type = 'message'
-    /// - instance is in scope (broadcast or direct)
+    /// Get unread messages for ordinary consumers. Accepted projected deliveries
+    /// are hidden because they have already crossed the consumer acceptance edge.
     pub fn get_unread_messages(&self, name: &str) -> Vec<Message> {
+        self.get_unread_messages_with_projection(name, false)
+    }
+
+    /// Get unresolved inbox messages for the Pi plugin's fetch/ACK transaction.
+    /// Include accepted deliveries so a plugin reload can consult its durable ledger
+    /// and finish the ACK without injecting the same user turn twice.
+    pub fn get_pi_unresolved_messages(&self, name: &str) -> Vec<Message> {
+        self.get_unread_messages_with_projection(name, true)
+    }
+
+    fn get_unread_messages_with_projection(
+        &self,
+        name: &str,
+        include_accepted: bool,
+    ) -> Vec<Message> {
         // Get last_event_id for this instance. A missing/unreadable row means there is
         // no recipient — return no unread rather than falling back to cursor 0, which
         // would treat the whole channel backlog (broadcasts match everyone) as unread.
@@ -153,6 +179,20 @@ impl HcomDb {
                 if !Self::should_deliver_to(&json, name) {
                     continue;
                 }
+                let message_id = json
+                    .get("message_id")
+                    .and_then(|value| value.as_str())
+                    .map(String::from);
+                let projected = message_id.as_deref().and_then(|value| {
+                    if include_accepted {
+                        self.projected_pi_recoverable_inbox_delivery(value, name)
+                    } else {
+                        self.projected_inbox_delivery(value, name)
+                    }
+                });
+                if projected == Some(false) {
+                    continue;
+                }
 
                 let from = json
                     .get("from")
@@ -185,10 +225,39 @@ impl HcomDb {
                     .get("bundle_id")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let relay = json
-                    .get("_relay")
+                let correlation_id = json
+                    .get("correlation_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let in_reply_to = json
+                    .get("in_reply_to")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let expects_reply = json
+                    .get("expects_reply")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let reply_endpoint = json
+                    .get("reply_endpoint")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let delivery_endpoint = json
+                    .get("delivery_endpoint")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let supersedes = json
+                    .get("supersedes")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let retry_of = json
+                    .get("retry_of")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let attachments = json
+                    .get("attachments")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                    .unwrap_or_default();
+                let relay = json.get("_relay").is_some();
 
                 messages.push(Message {
                     from,
@@ -199,6 +268,15 @@ impl HcomDb {
                     timestamp: Some(timestamp.clone()),
                     delivered_to,
                     bundle_id,
+                    message_id,
+                    correlation_id,
+                    in_reply_to,
+                    expects_reply,
+                    reply_endpoint,
+                    delivery_endpoint,
+                    supersedes,
+                    retry_of,
+                    attachments,
                     relay,
                 });
             }

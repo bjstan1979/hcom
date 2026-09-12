@@ -31,6 +31,9 @@ pub struct EventsArgs {
     /// Limit count (default: 20)
     #[arg(long)]
     pub last: Option<usize>,
+    /// Compatibility flag; query output is already NDJSON by default
+    #[arg(long, global = true)]
+    pub json: bool,
     /// Include archived sessions
     #[arg(long)]
     pub all: bool,
@@ -1391,6 +1394,15 @@ mod tests {
         use clap::Parser;
         let args = EventsArgs::try_parse_from(["events", "--last", "50"]).unwrap();
         assert_eq!(args.last, Some(50));
+    }
+    #[test]
+    fn test_events_json_compatibility_flag_is_accepted() {
+        use clap::Parser;
+        let args = EventsArgs::try_parse_from(["events", "--json", "--last", "1"]).unwrap();
+        assert!(args.json);
+        assert_eq!(args.last, Some(1));
+        let sub = EventsArgs::try_parse_from(["events", "sub", "list", "--json"]).unwrap();
+        assert!(sub.json);
     }
 
     #[test]

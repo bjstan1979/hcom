@@ -26,6 +26,7 @@ mod claude_actors;
 mod events;
 mod instances;
 mod kv;
+pub mod message_lifecycle;
 mod notify;
 pub(crate) mod reqwatch_policy;
 mod sessions;
@@ -35,9 +36,12 @@ pub use events::Message;
 pub use instances::InstanceRow;
 #[allow(unused_imports)]
 pub use instances::InstanceStatus;
+pub use message_lifecycle::{
+    MESSAGE_FEATURES, MESSAGE_PROTOCOL_V1, MessagePersistInput, MessagePersistResult,
+};
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 18;
+const SCHEMA_VERSION: i32 = 19;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -67,7 +71,519 @@ const MIGRATIONS: &[(i32, &str)] = &[
          CREATE INDEX IF NOT EXISTS idx_claude_actor_session
              ON claude_actor_capabilities(session_id);",
     ),
+    (
+        19,
+        "CREATE TABLE IF NOT EXISTS message_records (
+             message_id TEXT PRIMARY KEY,
+             event_id INTEGER NOT NULL UNIQUE,
+             correlation_id TEXT NOT NULL,
+             sender_name TEXT NOT NULL,
+             sender_session_id TEXT,
+             intent TEXT,
+             expects_reply INTEGER NOT NULL DEFAULT 0,
+             in_reply_to TEXT,
+             legacy_reply_to TEXT,
+             reply_endpoint TEXT,
+             supersedes TEXT,
+             retry_of TEXT,
+             attachments_json TEXT NOT NULL DEFAULT '[]',
+             created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS message_deliveries (
+             message_id TEXT NOT NULL,
+             recipient_name TEXT NOT NULL,
+             endpoint_epoch TEXT NOT NULL DEFAULT '',
+             delivery_endpoint TEXT NOT NULL DEFAULT 'inbox',
+             state TEXT NOT NULL,
+             attempt INTEGER NOT NULL DEFAULT 1,
+             state_event_id INTEGER,
+             last_actor TEXT NOT NULL DEFAULT '',
+             updated_at TEXT NOT NULL,
+             PRIMARY KEY(message_id, recipient_name),
+             FOREIGN KEY(message_id) REFERENCES message_records(message_id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_message_records_event ON message_records(event_id);
+         CREATE INDEX IF NOT EXISTS idx_message_records_correlation ON message_records(correlation_id);
+         CREATE INDEX IF NOT EXISTS idx_message_records_sender ON message_records(sender_name, created_at);
+         CREATE INDEX IF NOT EXISTS idx_message_records_reply_target ON message_records(in_reply_to);
+         CREATE INDEX IF NOT EXISTS idx_message_records_supersedes ON message_records(supersedes);
+         CREATE INDEX IF NOT EXISTS idx_message_records_retry_of ON message_records(retry_of);
+         CREATE INDEX IF NOT EXISTS idx_message_deliveries_recipient_state
+             ON message_deliveries(recipient_name, state, delivery_endpoint);",
+    ),
 ];
+#[derive(Clone, Copy)]
+struct ColumnShape {
+    not_null: bool,
+    primary_key_position: i64,
+}
+
+const MESSAGE_RECORD_COLUMNS: &[&str] = &[
+    "message_id",
+    "event_id",
+    "correlation_id",
+    "sender_name",
+    "sender_session_id",
+    "intent",
+    "expects_reply",
+    "in_reply_to",
+    "legacy_reply_to",
+    "reply_endpoint",
+    "supersedes",
+    "retry_of",
+    "attachments_json",
+    "created_at",
+];
+const MESSAGE_DELIVERY_COLUMNS: &[&str] = &[
+    "message_id",
+    "recipient_name",
+    "endpoint_epoch",
+    "delivery_endpoint",
+    "state",
+    "attempt",
+    "state_event_id",
+    "last_actor",
+    "updated_at",
+];
+const MESSAGE_INDEXES: &[(&str, &str, &[&str])] = &[
+    (
+        "idx_message_records_event",
+        "CREATE INDEX idx_message_records_event ON message_records(event_id)",
+        &["event_id"],
+    ),
+    (
+        "idx_message_records_correlation",
+        "CREATE INDEX idx_message_records_correlation ON message_records(correlation_id)",
+        &["correlation_id"],
+    ),
+    (
+        "idx_message_records_sender",
+        "CREATE INDEX idx_message_records_sender ON message_records(sender_name, created_at)",
+        &["sender_name", "created_at"],
+    ),
+    (
+        "idx_message_records_reply_target",
+        "CREATE INDEX idx_message_records_reply_target ON message_records(in_reply_to)",
+        &["in_reply_to"],
+    ),
+    (
+        "idx_message_records_supersedes",
+        "CREATE INDEX idx_message_records_supersedes ON message_records(supersedes)",
+        &["supersedes"],
+    ),
+    (
+        "idx_message_records_retry_of",
+        "CREATE INDEX idx_message_records_retry_of ON message_records(retry_of)",
+        &["retry_of"],
+    ),
+    (
+        "idx_message_deliveries_recipient_state",
+        "CREATE INDEX idx_message_deliveries_recipient_state ON message_deliveries(recipient_name, state, delivery_endpoint)",
+        &["recipient_name", "state", "delivery_endpoint"],
+    ),
+];
+
+fn table_shape(
+    conn: &Connection,
+    table: &str,
+) -> rusqlite::Result<std::collections::HashMap<String, ColumnShape>> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                ColumnShape {
+                    not_null: row.get::<_, i64>(3)? != 0,
+                    primary_key_position: row.get(5)?,
+                },
+            ))
+        })?
+        .collect()
+}
+
+fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
+
+fn index_columns(conn: &Connection, index: &str) -> rusqlite::Result<Vec<String>> {
+    let mut statement = conn.prepare(&format!("PRAGMA index_info({index})"))?;
+    statement
+        .query_map([], |row| row.get::<_, String>(2))?
+        .collect()
+}
+
+fn index_matches(
+    conn: &Connection,
+    index: &str,
+    expected_columns: &[&str],
+) -> rusqlite::Result<bool> {
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+        [index],
+        |row| row.get(0),
+    )? {
+        return Ok(false);
+    }
+    Ok(index_columns(conn, index)? == expected_columns)
+}
+
+fn has_unique_event_id(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA index_list({table})"))?;
+    let indexes = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (name, unique) in indexes {
+        if unique && index_columns(conn, &name)? == ["event_id"] {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn has_message_delivery_fk(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
+    let foreign_keys = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(foreign_keys.iter().any(|(parent, from, to, on_delete)| {
+        parent == "message_records"
+            && from == "message_id"
+            && to == "message_id"
+            && on_delete.eq_ignore_ascii_case("CASCADE")
+    }))
+}
+
+fn message_schema_v19_complete_checked(conn: &Connection) -> rusqlite::Result<bool> {
+    let records = table_shape(conn, "message_records")?;
+    let deliveries = table_shape(conn, "message_deliveries")?;
+    let records_required_not_null = [
+        "event_id",
+        "correlation_id",
+        "sender_name",
+        "expects_reply",
+        "attachments_json",
+        "created_at",
+    ];
+    let deliveries_required_not_null = [
+        "message_id",
+        "recipient_name",
+        "endpoint_epoch",
+        "delivery_endpoint",
+        "state",
+        "attempt",
+        "last_actor",
+        "updated_at",
+    ];
+    Ok(MESSAGE_RECORD_COLUMNS
+        .iter()
+        .all(|column| records.contains_key(*column))
+        && records
+            .get("message_id")
+            .map(|column| column.primary_key_position)
+            == Some(1)
+        && records_required_not_null
+            .iter()
+            .all(|name| records.get(*name).is_some_and(|column| column.not_null))
+        && has_unique_event_id(conn, "message_records")?
+        && MESSAGE_DELIVERY_COLUMNS
+            .iter()
+            .all(|column| deliveries.contains_key(*column))
+        && deliveries
+            .get("message_id")
+            .map(|column| column.primary_key_position)
+            == Some(1)
+        && deliveries
+            .get("recipient_name")
+            .map(|column| column.primary_key_position)
+            == Some(2)
+        && deliveries_required_not_null
+            .iter()
+            .all(|name| deliveries.get(*name).is_some_and(|column| column.not_null))
+        && has_message_delivery_fk(conn, "message_deliveries")?)
+}
+
+#[cfg(test)]
+fn message_schema_v19_complete(conn: &Connection) -> bool {
+    message_schema_v19_complete_checked(conn).unwrap_or(false)
+}
+
+fn message_indexes_v19_complete_checked(conn: &Connection) -> rusqlite::Result<bool> {
+    for (name, _, columns) in MESSAGE_INDEXES {
+        if !index_matches(conn, name, columns)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+fn message_indexes_v19_complete(conn: &Connection) -> bool {
+    message_indexes_v19_complete_checked(conn).unwrap_or(false)
+}
+
+fn create_message_records(conn: &Connection, table: &str) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE {table} (
+             message_id TEXT PRIMARY KEY,
+             event_id INTEGER NOT NULL UNIQUE,
+             correlation_id TEXT NOT NULL,
+             sender_name TEXT NOT NULL,
+             sender_session_id TEXT,
+             intent TEXT,
+             expects_reply INTEGER NOT NULL DEFAULT 0,
+             in_reply_to TEXT,
+             legacy_reply_to TEXT,
+             reply_endpoint TEXT,
+             supersedes TEXT,
+             retry_of TEXT,
+             attachments_json TEXT NOT NULL DEFAULT '[]',
+             created_at TEXT NOT NULL
+         );"
+    ))?;
+    Ok(())
+}
+
+fn create_message_deliveries(conn: &Connection, table: &str, parent_table: &str) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE {table} (
+             message_id TEXT NOT NULL,
+             recipient_name TEXT NOT NULL,
+             endpoint_epoch TEXT NOT NULL DEFAULT '',
+             delivery_endpoint TEXT NOT NULL DEFAULT 'inbox',
+             state TEXT NOT NULL,
+             attempt INTEGER NOT NULL DEFAULT 1,
+             state_event_id INTEGER,
+             last_actor TEXT NOT NULL DEFAULT '',
+             updated_at TEXT NOT NULL,
+             PRIMARY KEY(message_id, recipient_name),
+             FOREIGN KEY(message_id) REFERENCES {parent_table}(message_id) ON DELETE CASCADE
+         );"
+    ))?;
+    Ok(())
+}
+
+fn repair_message_indexes_v19(conn: &Connection) -> Result<()> {
+    for (name, sql, columns) in MESSAGE_INDEXES {
+        if index_matches(conn, name, columns)? {
+            continue;
+        }
+        conn.execute_batch(&format!("DROP INDEX IF EXISTS {name}; {sql};"))?;
+    }
+    Ok(())
+}
+
+fn copy_projection(
+    columns: &std::collections::HashMap<String, ColumnShape>,
+    row_count: i64,
+    specs: &[(&str, Option<&str>, &str)],
+) -> Result<String> {
+    let mut projection = Vec::with_capacity(specs.len());
+    for (name, missing_default, empty_placeholder) in specs {
+        if columns.contains_key(*name) {
+            projection.push((*name).to_string());
+        } else if let Some(default) = missing_default {
+            projection.push((*default).to_string());
+        } else if row_count == 0 {
+            projection.push((*empty_placeholder).to_string());
+        } else {
+            anyhow::bail!(
+                "lossless v19 lifecycle repair cannot be proven: non-empty table is missing required column {name}"
+            );
+        }
+    }
+    Ok(projection.join(", "))
+}
+
+fn foreign_key_violations(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA foreign_key_check({table})"))?;
+    Ok(statement.query([])?.next()?.is_some())
+}
+
+fn reconstruct_message_schema_v19(conn: &Connection) -> Result<()> {
+    const RECORD_NEW: &str = "message_records_v19_new";
+    const DELIVERY_NEW: &str = "message_deliveries_v19_new";
+    const RECORD_OLD: &str = "message_records_v19_old";
+    const DELIVERY_OLD: &str = "message_deliveries_v19_old";
+    for reserved in [RECORD_NEW, DELIVERY_NEW, RECORD_OLD, DELIVERY_OLD] {
+        if table_exists(conn, reserved)? {
+            anyhow::bail!(
+                "lossless v19 lifecycle repair cannot be proven: reserved table {reserved} already exists"
+            );
+        }
+    }
+
+    let record_columns = table_shape(conn, "message_records")?;
+    let delivery_columns = table_shape(conn, "message_deliveries")?;
+    if record_columns
+        .keys()
+        .any(|column| !MESSAGE_RECORD_COLUMNS.contains(&column.as_str()))
+        || delivery_columns
+            .keys()
+            .any(|column| !MESSAGE_DELIVERY_COLUMNS.contains(&column.as_str()))
+    {
+        anyhow::bail!(
+            "lossless v19 lifecycle repair cannot be proven: lifecycle table has unknown columns"
+        );
+    }
+
+    let record_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM message_records", [], |row| row.get(0))?;
+    let delivery_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM message_deliveries", [], |row| {
+            row.get(0)
+        })?;
+    let record_projection = copy_projection(
+        &record_columns,
+        record_count,
+        &[
+            ("message_id", None, "''"),
+            ("event_id", None, "0"),
+            ("correlation_id", None, "''"),
+            ("sender_name", None, "''"),
+            ("sender_session_id", Some("NULL"), "NULL"),
+            ("intent", Some("NULL"), "NULL"),
+            ("expects_reply", Some("0"), "0"),
+            ("in_reply_to", Some("NULL"), "NULL"),
+            ("legacy_reply_to", Some("NULL"), "NULL"),
+            ("reply_endpoint", Some("NULL"), "NULL"),
+            ("supersedes", Some("NULL"), "NULL"),
+            ("retry_of", Some("NULL"), "NULL"),
+            ("attachments_json", Some("'[]'"), "'[]'"),
+            ("created_at", None, "''"),
+        ],
+    )?;
+    let delivery_projection = copy_projection(
+        &delivery_columns,
+        delivery_count,
+        &[
+            ("message_id", None, "''"),
+            ("recipient_name", None, "''"),
+            ("endpoint_epoch", Some("''"), "''"),
+            ("delivery_endpoint", Some("'inbox'"), "'inbox'"),
+            ("state", None, "''"),
+            ("attempt", Some("1"), "1"),
+            ("state_event_id", Some("NULL"), "NULL"),
+            ("last_actor", Some("''"), "''"),
+            ("updated_at", None, "''"),
+        ],
+    )?;
+
+    create_message_records(conn, RECORD_NEW)?;
+    create_message_deliveries(conn, DELIVERY_NEW, RECORD_NEW)?;
+    conn.execute_batch(&format!(
+        "INSERT INTO {RECORD_NEW} ({}) SELECT {record_projection} FROM message_records;
+         INSERT INTO {DELIVERY_NEW} ({}) SELECT {delivery_projection} FROM message_deliveries;",
+        MESSAGE_RECORD_COLUMNS.join(", "),
+        MESSAGE_DELIVERY_COLUMNS.join(", "),
+    ))
+    .context("lossless v19 lifecycle copy failed constraint validation")?;
+
+    let copied_records: i64 =
+        conn.query_row(&format!("SELECT COUNT(*) FROM {RECORD_NEW}"), [], |row| {
+            row.get(0)
+        })?;
+    let copied_deliveries: i64 =
+        conn.query_row(&format!("SELECT COUNT(*) FROM {DELIVERY_NEW}"), [], |row| {
+            row.get(0)
+        })?;
+    if copied_records != record_count || copied_deliveries != delivery_count {
+        anyhow::bail!(
+            "lossless v19 lifecycle repair row-count mismatch: records {record_count}/{copied_records}, deliveries {delivery_count}/{copied_deliveries}"
+        );
+    }
+    if foreign_key_violations(conn, DELIVERY_NEW)? {
+        anyhow::bail!("lossless v19 lifecycle repair found foreign-key violations");
+    }
+
+    conn.execute_batch(&format!(
+        "ALTER TABLE message_deliveries RENAME TO {DELIVERY_OLD};
+         ALTER TABLE message_records RENAME TO {RECORD_OLD};
+         ALTER TABLE {RECORD_NEW} RENAME TO message_records;
+         ALTER TABLE {DELIVERY_NEW} RENAME TO message_deliveries;
+         DROP TABLE {DELIVERY_OLD};
+         DROP TABLE {RECORD_OLD};"
+    ))?;
+    if conn.query_row("SELECT COUNT(*) FROM message_records", [], |row| {
+        row.get::<_, i64>(0)
+    })? != record_count
+        || conn.query_row("SELECT COUNT(*) FROM message_deliveries", [], |row| {
+            row.get::<_, i64>(0)
+        })? != delivery_count
+        || foreign_key_violations(conn, "message_deliveries")?
+        || !message_schema_v19_complete_checked(conn)?
+    {
+        anyhow::bail!("lossless v19 lifecycle repair failed post-swap validation");
+    }
+    Ok(())
+}
+
+fn repair_message_schema_v19(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "message_records")? {
+        create_message_records(conn, "message_records")?;
+    }
+    if !table_exists(conn, "message_deliveries")? {
+        create_message_deliveries(conn, "message_deliveries", "message_records")?;
+    }
+
+    let additive_record_columns = [
+        ("sender_session_id", "TEXT"),
+        ("intent", "TEXT"),
+        ("expects_reply", "INTEGER NOT NULL DEFAULT 0"),
+        ("in_reply_to", "TEXT"),
+        ("legacy_reply_to", "TEXT"),
+        ("reply_endpoint", "TEXT"),
+        ("supersedes", "TEXT"),
+        ("retry_of", "TEXT"),
+        ("attachments_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ];
+    let additive_delivery_columns = [
+        ("endpoint_epoch", "TEXT NOT NULL DEFAULT ''"),
+        ("delivery_endpoint", "TEXT NOT NULL DEFAULT 'inbox'"),
+        ("attempt", "INTEGER NOT NULL DEFAULT 1"),
+        ("state_event_id", "INTEGER"),
+        ("last_actor", "TEXT NOT NULL DEFAULT ''"),
+    ];
+    let mut records = table_shape(conn, "message_records")?;
+    for (name, definition) in additive_record_columns {
+        if !records.contains_key(name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE message_records ADD COLUMN {name} {definition}"
+            ))?;
+            records = table_shape(conn, "message_records")?;
+        }
+    }
+    let mut deliveries = table_shape(conn, "message_deliveries")?;
+    for (name, definition) in additive_delivery_columns {
+        if !deliveries.contains_key(name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE message_deliveries ADD COLUMN {name} {definition}"
+            ))?;
+            deliveries = table_shape(conn, "message_deliveries")?;
+        }
+    }
+
+    if !message_schema_v19_complete_checked(conn)? {
+        reconstruct_message_schema_v19(conn)?;
+    }
+    repair_message_indexes_v19(conn)?;
+    if !message_schema_v19_complete_checked(conn)? || !message_indexes_v19_complete_checked(conn)? {
+        anyhow::bail!("v19 lifecycle schema repair did not produce the canonical schema");
+    }
+    Ok(())
+}
 
 /// Schema compatibility check result
 enum SchemaCompat {
@@ -77,6 +593,28 @@ enum SchemaCompat {
     NeedsArchive(String, Option<i32>),
     /// DB is newer than code — stale process, work with existing schema
     StaleProcess,
+}
+
+enum LockedSchemaResult {
+    Ready,
+    Archive(String),
+}
+
+fn is_transient_schema_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let Some(rusqlite::Error::SqliteFailure(sqlite, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        else {
+            return false;
+        };
+        matches!(
+            sqlite.code,
+            rusqlite::ffi::ErrorCode::DatabaseBusy
+                | rusqlite::ffi::ErrorCode::DatabaseLocked
+                | rusqlite::ffi::ErrorCode::SchemaChanged
+                | rusqlite::ffi::ErrorCode::FileLockingProtocolFailed
+        )
+    })
 }
 
 /// Database handle for hcom operations
@@ -338,6 +876,8 @@ impl HcomDb {
                 idle_since TEXT DEFAULT '',
                 pid INTEGER DEFAULT NULL,
                 launch_context TEXT DEFAULT '',
+                endpoint_epoch TEXT NOT NULL DEFAULT '',
+                presence_json TEXT NOT NULL DEFAULT '{}',
                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
             );
 
@@ -355,6 +895,44 @@ impl HcomDb {
             );
             CREATE INDEX IF NOT EXISTS idx_claude_actor_expiry ON claude_actor_capabilities(expires_at);
             CREATE INDEX IF NOT EXISTS idx_claude_actor_session ON claude_actor_capabilities(session_id);
+            -- Per-message lifecycle projections
+            CREATE TABLE IF NOT EXISTS message_records (
+                message_id TEXT PRIMARY KEY,
+                event_id INTEGER NOT NULL UNIQUE,
+                correlation_id TEXT NOT NULL,
+                sender_name TEXT NOT NULL,
+                sender_session_id TEXT,
+                intent TEXT,
+                expects_reply INTEGER NOT NULL DEFAULT 0,
+                in_reply_to TEXT,
+                legacy_reply_to TEXT,
+                reply_endpoint TEXT,
+                supersedes TEXT,
+                retry_of TEXT,
+                attachments_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS message_deliveries (
+                message_id TEXT NOT NULL,
+                recipient_name TEXT NOT NULL,
+                endpoint_epoch TEXT NOT NULL DEFAULT '',
+                delivery_endpoint TEXT NOT NULL DEFAULT 'inbox',
+                state TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                state_event_id INTEGER,
+                last_actor TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(message_id, recipient_name),
+                FOREIGN KEY(message_id) REFERENCES message_records(message_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_records_event ON message_records(event_id);
+            CREATE INDEX IF NOT EXISTS idx_message_records_correlation ON message_records(correlation_id);
+            CREATE INDEX IF NOT EXISTS idx_message_records_sender ON message_records(sender_name, created_at);
+            CREATE INDEX IF NOT EXISTS idx_message_records_reply_target ON message_records(in_reply_to);
+            CREATE INDEX IF NOT EXISTS idx_message_records_supersedes ON message_records(supersedes);
+            CREATE INDEX IF NOT EXISTS idx_message_records_retry_of ON message_records(retry_of);
+            CREATE INDEX IF NOT EXISTS idx_message_deliveries_recipient_state
+                ON message_deliveries(recipient_name, state, delivery_endpoint);
 
             -- KV table
             CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
@@ -389,6 +967,16 @@ impl HcomDb {
                 json_extract(data, '$.thread') as msg_thread,
                 json_extract(data, '$.reply_to') as msg_reply_to,
                 json_extract(data, '$.reply_to_local') as msg_reply_to_local,
+                json_extract(data, '$.protocol') as msg_protocol,
+                json_extract(data, '$.message_id') as msg_message_id,
+                json_extract(data, '$.correlation_id') as msg_correlation_id,
+                json_extract(data, '$.in_reply_to') as msg_in_reply_to,
+                json_extract(data, '$.expects_reply') as msg_expects_reply,
+                json_extract(data, '$.reply_endpoint') as msg_reply_endpoint,
+                json_extract(data, '$.delivery_endpoint') as msg_delivery_endpoint,
+                json_extract(data, '$.supersedes') as msg_supersedes,
+                json_extract(data, '$.retry_of') as msg_retry_of,
+                json_extract(data, '$.attachments') as msg_attachments,
                 json_extract(data, '$.bundle_id') as bundle_id,
                 json_extract(data, '$.title') as bundle_title,
                 json_extract(data, '$.description') as bundle_description,
@@ -440,94 +1028,118 @@ impl HcomDb {
     /// Call after open() for production use.
     pub fn ensure_schema(&mut self) -> Result<()> {
         match self.check_schema_compat()? {
-            SchemaCompat::Ok => {
-                self.init_db()?;
-                Ok(())
+            SchemaCompat::Ok => return self.init_db(),
+            SchemaCompat::StaleProcess => return Ok(()),
+            SchemaCompat::NeedsArchive(_, _) => {}
+        }
+
+        const MAX_RECONCILE_ATTEMPTS: usize = 3;
+        let mut attempt = 0usize;
+        let archive_reason = loop {
+            attempt += 1;
+            match self.reconcile_schema_locked() {
+                Ok(LockedSchemaResult::Ready) => return Ok(()),
+                Ok(LockedSchemaResult::Archive(reason)) => break reason,
+                Err(error)
+                    if is_transient_schema_error(&error) && attempt < MAX_RECONCILE_ATTEMPTS =>
+                {
+                    self.reconnect_schema_retry(attempt)?;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).context(
+                        "schema migration failed closed; database was not archived or deleted",
+                    );
+                }
             }
-            SchemaCompat::NeedsArchive(reason, old_version) => {
-                if let Some(version) = old_version {
-                    // A DB can be stamped at some version yet be missing columns
-                    // an earlier migration should have added ("stamped without
-                    // migration"). The stamp alone can't tell us how far back to
-                    // start, so key off the columns actually present.
-                    let migrate_from = self.repair_migrate_from(version);
-                    match self.try_apply_migrations(migrate_from) {
-                        Ok(true) => return Ok(()),
-                        Ok(false) => {}
-                        Err(e) => {
-                            crate::log::log_warn(
-                                "db",
-                                "schema.migration_failed",
-                                &format!("v{} -> v{} failed: {}", migrate_from, SCHEMA_VERSION, e),
-                            );
+        };
+
+        eprintln!("hcom: {}, archiving...", archive_reason);
+        // This path is reachable only after a BEGIN IMMEDIATE holder re-read the
+        // version and schema and proved there is no lossless migration path.
+        self.snapshot_running_to_pidtrack();
+        self.conn = Connection::open_in_memory()?;
+        let archive_path = Self::archive_db_at(&self.db_path)?;
+        if let Some(ref path) = archive_path {
+            eprintln!("hcom: Archived to {}", path);
+            eprintln!("       Query with: hcom archive 1");
+        }
+
+        self.conn = Self::open_connection(&self.db_path).with_context(|| {
+            format!(
+                "Failed to reopen DB after archive: {}",
+                self.db_path.display()
+            )
+        })?;
+        self.db_inode = get_inode(&self.db_path);
+        self.init_db()?;
+        self.log_reset_event()?;
+        Ok(())
+    }
+
+    fn reconnect_schema_retry(&mut self, attempt: usize) -> Result<()> {
+        std::thread::sleep(std::time::Duration::from_millis(10 * attempt as u64));
+        self.conn = Self::open_connection(&self.db_path).with_context(|| {
+            format!(
+                "failed to reconnect for bounded schema migration retry: {}",
+                self.db_path.display()
+            )
+        })?;
+        self.db_inode = get_inode(&self.db_path);
+        Ok(())
+    }
+
+    fn reconcile_schema_locked(&self) -> Result<LockedSchemaResult> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .context("failed to acquire immediate schema migration lock")?;
+        let result = match Self::check_schema_compat_on(&transaction)? {
+            SchemaCompat::Ok | SchemaCompat::StaleProcess => LockedSchemaResult::Ready,
+            SchemaCompat::NeedsArchive(reason, None) => LockedSchemaResult::Archive(reason),
+            SchemaCompat::NeedsArchive(reason, Some(version)) => {
+                if !table_exists(&transaction, "instances")? {
+                    LockedSchemaResult::Archive(reason)
+                } else {
+                    let migrate_from = Self::repair_migrate_from(&transaction, version)?;
+                    if Self::try_apply_migrations(&transaction, migrate_from)? {
+                        match Self::check_schema_compat_on(&transaction)? {
+                            SchemaCompat::Ok | SchemaCompat::StaleProcess => {
+                                LockedSchemaResult::Ready
+                            }
+                            SchemaCompat::NeedsArchive(revalidated_reason, _) => {
+                                LockedSchemaResult::Archive(revalidated_reason)
+                            }
                         }
+                    } else {
+                        LockedSchemaResult::Archive(reason)
                     }
                 }
-                eprintln!("hcom: {}, archiving...", reason);
-
-                // Snapshot running instances to pidtrack before archive so orphan
-                // recovery can re-register them into the fresh DB.
-                self.snapshot_running_to_pidtrack();
-
-                // Release our handle to the old DB file before archiving. Windows
-                // refuses to delete a file that still has an open handle; Unix
-                // unlinks an open file fine, so this is a no-op there.
-                //
-                // This only releases *our own* connection. If any other hcom
-                // process — another agent instance, a relay worker, a hook
-                // invocation — has the same DB file open at this moment, the
-                // `remove_file` inside `archive_db_at` below can still fail on
-                // Windows; see the doc comment there for why closing our own
-                // handle isn't sufficient in general.
-                self.conn = Connection::open_in_memory()?;
-
-                // Archive the old DB
-                let archive_path = Self::archive_db_at(&self.db_path)?;
-                if let Some(ref path) = archive_path {
-                    eprintln!("hcom: Archived to {}", path);
-                    eprintln!("       Query with: hcom archive 1");
-                }
-
-                // Reconnect to fresh DB file
-                let new_conn = Self::open_connection(&self.db_path).with_context(|| {
-                    format!(
-                        "Failed to reopen DB after archive: {}",
-                        self.db_path.display()
-                    )
-                })?;
-                self.conn = new_conn;
-                self.db_inode = get_inode(&self.db_path);
-
-                // Init fresh schema
-                self.init_db()?;
-
-                // Log reset event to fresh DB
-                self.log_reset_event()?;
-
-                Ok(())
             }
-            SchemaCompat::StaleProcess => {
-                // DB is newer than our code — work with it, don't archive
-                Ok(())
+        };
+        match result {
+            LockedSchemaResult::Ready => {
+                transaction.commit()?;
+                Ok(LockedSchemaResult::Ready)
+            }
+            LockedSchemaResult::Archive(reason) => {
+                transaction.rollback()?;
+                Ok(LockedSchemaResult::Archive(reason))
             }
         }
     }
 
     /// Internal: check schema compatibility without taking action.
     fn check_schema_compat(&self) -> Result<SchemaCompat> {
-        let version: i32 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap_or(0);
+        Self::check_schema_compat_on(&self.conn)
+    }
+
+    fn check_schema_compat_on(conn: &Connection) -> Result<SchemaCompat> {
+        let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
         // Check what tables exist
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
+        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
         let tables: std::collections::HashSet<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<_>>()?;
 
         let required: std::collections::HashSet<&str> = [
             "events",
@@ -536,6 +1148,8 @@ impl HcomDb {
             "notify_endpoints",
             "session_bindings",
             "claude_actor_capabilities",
+            "message_records",
+            "message_deliveries",
         ]
         .into_iter()
         .collect();
@@ -545,8 +1159,7 @@ impl HcomDb {
             if !tables.is_empty() && required.iter().any(|t| tables.contains(*t)) {
                 let mut resolved_version = 0i32;
                 for _ in 0..20 {
-                    let v2: i32 = self
-                        .conn
+                    let v2: i32 = conn
                         .query_row("PRAGMA user_version", [], |row| row.get(0))
                         .unwrap_or(0);
                     if v2 != 0 {
@@ -625,35 +1238,40 @@ impl HcomDb {
             let missing: Vec<&&str> = required.iter().filter(|t| !tables.contains(**t)).collect();
             return Ok(SchemaCompat::NeedsArchive(
                 format!("DB missing tables {:?}", missing),
-                None,
+                Some(version),
             ));
         }
 
         // Column guard: verify all expected columns exist (catches partial schema from
         // version bump before migration was written)
-        let missing_col: Option<String> = self
-            .conn
-            .prepare("PRAGMA table_info(instances)")
-            .and_then(|mut s| {
-                let cols: Vec<String> = s
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                let required = [
-                    "tool",
-                    "terminal_preset_requested",
-                    "terminal_preset_effective",
-                    "last_seen",
-                ];
-                Ok(required
-                    .iter()
-                    .find(|c| !cols.contains(&c.to_string()))
-                    .map(|s| s.to_string()))
-            })
-            .unwrap_or(None);
+        let instance_columns = table_shape(conn, "instances")?;
+        let required_instance_columns = [
+            "tool",
+            "terminal_preset_requested",
+            "terminal_preset_effective",
+            "last_seen",
+            "endpoint_epoch",
+            "presence_json",
+        ];
+        let missing_col = required_instance_columns
+            .iter()
+            .find(|column| !instance_columns.contains_key(**column))
+            .map(|column| (*column).to_string());
         if let Some(col) = missing_col {
             return Ok(SchemaCompat::NeedsArchive(
                 format!("DB schema missing instances.{}", col),
+                Some(version),
+            ));
+        }
+        if !message_schema_v19_complete_checked(conn)? {
+            return Ok(SchemaCompat::NeedsArchive(
+                "DB schema has incomplete v19 message projections".to_string(),
+                Some(version),
+            ));
+        }
+        if !message_indexes_v19_complete_checked(conn)? {
+            return Ok(SchemaCompat::NeedsArchive(
+                "DB schema has incomplete v19 message indexes".to_string(),
                 Some(version),
             ));
         }
@@ -668,51 +1286,57 @@ impl HcomDb {
     /// ran. We walk back to the migration that adds the earliest column still
     /// missing; a genuinely up-to-date-but-one-behind DB (all older columns
     /// present) just re-runs the remaining steps.
-    fn repair_migrate_from(&self, version: i32) -> i32 {
-        let columns: std::collections::HashSet<String> = self
-            .conn
-            .prepare("PRAGMA table_info(instances)")
-            .and_then(|mut s| {
-                Ok(s.query_map([], |row| row.get::<_, String>(1))?
-                    .filter_map(|r| r.ok())
-                    .collect())
-            })
-            .unwrap_or_default();
+    fn repair_migrate_from(conn: &Connection, version: i32) -> Result<i32> {
+        let mut statement = conn.prepare("PRAGMA table_info(instances)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
 
         // (migration version, a column that migration introduces)
-        const COLUMN_MIGRATIONS: &[(i32, &str)] =
-            &[(17, "terminal_preset_requested"), (18, "last_seen")];
+        const COLUMN_MIGRATIONS: &[(i32, &str)] = &[
+            (17, "terminal_preset_requested"),
+            (18, "last_seen"),
+            (19, "endpoint_epoch"),
+            (19, "presence_json"),
+        ];
         for (migration, column) in COLUMN_MIGRATIONS {
             if !columns.contains(*column) {
-                return migration - 1;
+                return Ok(migration - 1);
             }
         }
 
         // All migration-added columns present: ordinary version-behind DB, or a
         // current stamp flagged for some other reason — re-run just the last step.
-        if version >= SCHEMA_VERSION {
+        Ok(if version >= SCHEMA_VERSION {
             SCHEMA_VERSION - 1
         } else {
             version
-        }
+        })
     }
 
-    /// Try in-place migration for consecutive schema versions.
+    /// Try in-place migration for consecutive schema versions inside the caller's
+    /// already-acquired `BEGIN IMMEDIATE` transaction.
     ///
-    /// Returns `Ok(false)` if any step is missing from `MIGRATIONS`,
-    /// causing `ensure_schema()` to fall back to archive+recreate.
-    fn try_apply_migrations(&self, old_version: i32) -> Result<bool> {
+    /// Returns `Ok(false)` only when the migration chain is genuinely unavailable.
+    /// SQL/schema errors are returned so callers fail closed instead of archiving.
+    fn try_apply_migrations(tx: &Transaction<'_>, old_version: i32) -> Result<bool> {
         if old_version <= 0 || old_version >= SCHEMA_VERSION {
             return Ok(false);
         }
-        let tx = self.conn.unchecked_transaction()?;
+        if ((old_version + 1)..=SCHEMA_VERSION).any(|version| {
+            !MIGRATIONS
+                .iter()
+                .any(|(candidate, _)| *candidate == version)
+        }) {
+            return Ok(false);
+        }
         for next_version in (old_version + 1)..=SCHEMA_VERSION {
             if next_version == 17 {
                 let has_launch_context = tx
                     .prepare("PRAGMA table_info(instances)")?
                     .query_map([], |row| row.get::<_, String>(1))?
-                    .filter_map(|r| r.ok())
-                    .any(|col| col == "launch_context");
+                    .filter_map(|row| row.ok())
+                    .any(|column| column == "launch_context");
                 if !has_launch_context {
                     tx.execute(
                         "ALTER TABLE instances ADD COLUMN launch_context TEXT DEFAULT ''",
@@ -720,9 +1344,30 @@ impl HcomDb {
                     )?;
                 }
             }
-            let Some((_, sql)) = MIGRATIONS.iter().find(|(v, _)| *v == next_version) else {
-                return Ok(false);
-            };
+            if next_version == 19 {
+                let columns: std::collections::HashSet<String> = tx
+                    .prepare("PRAGMA table_info(instances)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|row| row.ok())
+                    .collect();
+                if !columns.contains("endpoint_epoch") {
+                    tx.execute(
+                        "ALTER TABLE instances ADD COLUMN endpoint_epoch TEXT NOT NULL DEFAULT ''",
+                        [],
+                    )?;
+                }
+                if !columns.contains("presence_json") {
+                    tx.execute(
+                        "ALTER TABLE instances ADD COLUMN presence_json TEXT NOT NULL DEFAULT '{}'",
+                        [],
+                    )?;
+                }
+                repair_message_schema_v19(tx)?;
+            }
+            let (_, sql) = MIGRATIONS
+                .iter()
+                .find(|(version, _)| *version == next_version)
+                .expect("migration chain was validated before applying");
             let has_status_time = if next_version == 18 {
                 let mut statement = tx.prepare("PRAGMA table_info(instances)")?;
                 let columns: Vec<String> = statement
@@ -740,9 +1385,8 @@ impl HcomDb {
                     [],
                 )?;
             }
-            tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
+            tx.execute_batch(&format!("PRAGMA user_version = {next_version}"))?;
         }
-        tx.commit()?;
         Ok(true)
     }
 
@@ -1542,6 +2186,34 @@ pub(super) mod tests {
                      last_seen INTEGER NOT NULL,
                      UNIQUE(session_id, tool_use_id, agent_id)
                  );
+                 CREATE TABLE message_records (
+                     message_id TEXT PRIMARY KEY,
+                     event_id INTEGER NOT NULL UNIQUE,
+                     correlation_id TEXT NOT NULL,
+                     sender_name TEXT NOT NULL,
+                     sender_session_id TEXT,
+                     intent TEXT,
+                     expects_reply INTEGER NOT NULL DEFAULT 0,
+                     in_reply_to TEXT,
+                     legacy_reply_to TEXT,
+                     reply_endpoint TEXT,
+                     supersedes TEXT,
+                     retry_of TEXT,
+                     attachments_json TEXT NOT NULL DEFAULT '[]',
+                     created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE message_deliveries (
+                     message_id TEXT NOT NULL,
+                     recipient_name TEXT NOT NULL,
+                     endpoint_epoch TEXT NOT NULL DEFAULT '',
+                     delivery_endpoint TEXT NOT NULL DEFAULT 'inbox',
+                     state TEXT NOT NULL,
+                     attempt INTEGER NOT NULL DEFAULT 1,
+                     state_event_id INTEGER,
+                     last_actor TEXT NOT NULL DEFAULT '',
+                     updated_at TEXT NOT NULL,
+                     PRIMARY KEY(message_id, recipient_name)
+                 );
                  PRAGMA user_version = {};",
                 SCHEMA_VERSION
             ))
@@ -1695,5 +2367,364 @@ pub(super) mod tests {
         assert_eq!(name, "luna");
 
         cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_schema_18_to_19_migrates_in_place_preserving_events_instances_and_cursor() {
+        let (mut db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, last_event_id, created_at)
+                 VALUES ('luna', 41, 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, timestamp, type, instance, data)
+                 VALUES (42, '2026-01-01T00:00:00Z', 'message', 'luna', '{\"text\":\"preserve\"}')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "DROP TABLE message_deliveries;
+                 DROP TABLE message_records;
+                 PRAGMA user_version = 18;",
+            )
+            .unwrap();
+
+        db.ensure_schema().unwrap();
+        assert_eq!(
+            db.conn()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            19
+        );
+        assert!(message_schema_v19_complete(db.conn()));
+        assert!(message_indexes_v19_complete(db.conn()));
+        let cursor: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = 'luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, 41);
+        let event: String = db
+            .conn()
+            .query_row("SELECT data FROM events WHERE id = 42", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(event.contains("preserve"));
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_incomplete_v19_repairs_idempotently_without_losing_state_planes() {
+        let (mut db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, last_event_id, created_at)
+                 VALUES ('nova', 77, 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, timestamp, type, instance, data)
+                 VALUES (78, '2026-01-01T00:00:00Z', 'status', 'nova', '{\"status\":\"active\"}')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "DROP TABLE message_deliveries;
+                 DROP TABLE message_records;
+                 CREATE TABLE message_records (message_id TEXT PRIMARY KEY);
+                 PRAGMA user_version = 19;",
+            )
+            .unwrap();
+
+        db.ensure_schema().unwrap();
+        db.ensure_schema().unwrap();
+        assert!(message_schema_v19_complete(db.conn()));
+        assert!(message_indexes_v19_complete(db.conn()));
+        let cursor: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = 'nova'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, 77);
+        let event_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events WHERE id = 78", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(event_count, 1);
+        let instance_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM instances WHERE name = 'nova'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(instance_count, 1);
+        cleanup_test_db(db_path);
+    }
+    #[test]
+    fn test_concurrent_18_to_19_migration_is_lossless_and_never_archives() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("hcom.db");
+        {
+            let db = HcomDb::open_at(&db_path).unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, last_event_id, created_at)
+                     VALUES ('sentinel', 901, 1.0)",
+                    [],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO events (id, timestamp, type, instance, data)
+                     VALUES (902, '2026-01-01T00:00:00Z', 'message', 'sentinel',
+                             '{\"text\":\"concurrent-preserve\"}')",
+                    [],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO kv (key, value) VALUES ('sentinel_cursor', 'cursor-901')",
+                    [],
+                )
+                .unwrap();
+            db.conn()
+                .execute_batch(
+                    "DROP TABLE message_deliveries;
+                     DROP TABLE message_records;
+                     PRAGMA user_version = 18;",
+                )
+                .unwrap();
+        }
+
+        let worker_count = 12usize;
+        let barrier = Arc::new(Barrier::new(worker_count + 1));
+        let mut workers = Vec::new();
+        for _ in 0..worker_count {
+            let path = db_path.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || -> Result<()> {
+                let mut db = HcomDb::open_raw(&path)?;
+                barrier.wait();
+                db.ensure_schema()
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        assert!(!temp.path().join("archive").exists());
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        assert_eq!(
+            db.conn()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(message_schema_v19_complete(db.conn()));
+        assert!(message_indexes_v19_complete(db.conn()));
+        let sentinel: (i64, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT i.last_event_id, e.data, k.value
+                 FROM instances i
+                 JOIN events e ON e.id = 902
+                 JOIN kv k ON k.key = 'sentinel_cursor'
+                 WHERE i.name = 'sentinel'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sentinel.0, 901);
+        assert!(sentinel.1.contains("concurrent-preserve"));
+        assert_eq!(sentinel.2, "cursor-901");
+        assert_eq!(
+            db.conn()
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        let scratch_tables: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name GLOB 'message_*_v19_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scratch_tables, 0);
+    }
+
+    #[test]
+    fn test_incomplete_v19_reconstruction_preserves_accepted_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("hcom.db");
+        let mut db = HcomDb::open_at(&db_path).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO events (id, timestamp, type, instance, data)
+                 VALUES (500, '2026-01-01T00:00:00Z', 'message', 'sender', '{}');
+                 DROP TABLE message_deliveries;
+                 DROP TABLE message_records;
+                 CREATE TABLE message_records (
+                     message_id TEXT, event_id INTEGER, correlation_id TEXT, sender_name TEXT,
+                     sender_session_id TEXT, intent TEXT, expects_reply INTEGER,
+                     in_reply_to TEXT, legacy_reply_to TEXT, reply_endpoint TEXT,
+                     supersedes TEXT, retry_of TEXT, attachments_json TEXT, created_at TEXT
+                 );
+                 CREATE TABLE message_deliveries (
+                     message_id TEXT, recipient_name TEXT, endpoint_epoch TEXT,
+                     delivery_endpoint TEXT, state TEXT, attempt INTEGER,
+                     state_event_id INTEGER, last_actor TEXT, updated_at TEXT
+                 );
+                 INSERT INTO message_records VALUES (
+                     'msg-accepted', 500, 'corr-500', 'sender', 'session-s', 'request', 1,
+                     NULL, NULL, 'request:msg-accepted', NULL, NULL, '[]',
+                     '2026-01-01T00:00:00Z'
+                 );
+                 INSERT INTO message_deliveries VALUES (
+                     'msg-accepted', 'recipient', 'epoch-7', 'inbox', 'accepted', 2,
+                     501, 'recipient', '2026-01-01T00:00:01Z'
+                 );
+                 PRAGMA user_version = 19;",
+            )
+            .unwrap();
+
+        db.ensure_schema().unwrap();
+        assert!(!temp.path().join("archive").exists());
+        assert!(message_schema_v19_complete(db.conn()));
+        assert!(message_indexes_v19_complete(db.conn()));
+        let delivery: (String, String, String, i64, Option<i64>, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT message_id, endpoint_epoch, state, attempt, state_event_id,
+                        last_actor, updated_at
+                 FROM message_deliveries WHERE recipient_name = 'recipient'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            delivery,
+            (
+                "msg-accepted".to_string(),
+                "epoch-7".to_string(),
+                "accepted".to_string(),
+                2,
+                Some(501),
+                "recipient".to_string(),
+                "2026-01-01T00:00:01Z".to_string(),
+            )
+        );
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM message_records", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert!(!foreign_key_violations(db.conn(), "message_deliveries").unwrap());
+    }
+
+    #[test]
+    fn test_impossible_v19_lossless_repair_fails_closed_without_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("hcom.db");
+        let mut db = HcomDb::open_at(&db_path).unwrap();
+        db.conn()
+            .execute_batch(
+                "DROP TABLE message_deliveries;
+                 DROP TABLE message_records;
+                 CREATE TABLE message_records (
+                     message_id TEXT PRIMARY KEY,
+                     correlation_id TEXT NOT NULL,
+                     sender_name TEXT NOT NULL,
+                     created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE message_deliveries (
+                     message_id TEXT NOT NULL,
+                     recipient_name TEXT NOT NULL,
+                     endpoint_epoch TEXT NOT NULL DEFAULT '',
+                     delivery_endpoint TEXT NOT NULL DEFAULT 'inbox',
+                     state TEXT NOT NULL,
+                     attempt INTEGER NOT NULL DEFAULT 1,
+                     state_event_id INTEGER,
+                     last_actor TEXT NOT NULL DEFAULT '',
+                     updated_at TEXT NOT NULL,
+                     PRIMARY KEY(message_id, recipient_name),
+                     FOREIGN KEY(message_id) REFERENCES message_records(message_id) ON DELETE CASCADE
+                 );
+                 INSERT INTO message_records
+                     (message_id, correlation_id, sender_name, created_at)
+                 VALUES ('cannot-prove', 'corr-x', 'sender', '2026-01-01T00:00:00Z');
+                 PRAGMA user_version = 19;",
+            )
+            .unwrap();
+
+        let error = db.ensure_schema().unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("lossless v19 lifecycle repair cannot be proven"));
+        assert!(message.contains("missing required column event_id"));
+        assert!(message.contains("database was not archived or deleted"));
+        assert!(!temp.path().join("archive").exists());
+        assert!(db_path.exists());
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT message_id FROM message_records", [], |row| row
+                    .get::<_, String>(
+                    0
+                ),)
+                .unwrap(),
+            "cannot-prove"
+        );
+        assert_eq!(
+            db.conn()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let scratch_tables: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name GLOB 'message_*_v19_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scratch_tables, 0);
     }
 }

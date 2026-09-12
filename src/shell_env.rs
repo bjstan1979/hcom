@@ -108,7 +108,21 @@ fn timed_shell_output_with_timeout(
     marker: &str,
     timeout: Duration,
 ) -> Option<ShellOutput> {
+    timed_shell_output_with_timeout_observed(shell, cmd, marker, timeout, |_| {})
+}
+
+fn timed_shell_output_with_timeout_observed<F>(
+    shell: &Path,
+    cmd: &str,
+    marker: &str,
+    timeout: Duration,
+    on_spawn: F,
+) -> Option<ShellOutput>
+where
+    F: FnOnce(u32),
+{
     let mut child = shell_command(shell, cmd, marker).spawn().ok()?;
+    on_spawn(child.id());
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -453,27 +467,26 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn timeout_kills_shell_process_group() {
-        let shell = test_shell_path();
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("resolver-pids");
-        let pid_file_str = pid_file.to_string_lossy();
-        let pid_file_arg = shell_words::quote(pid_file_str.as_ref());
-        // The killed scope is the shell's process group. An interactive login
-        // shell may give `&` jobs their own group (job control), so descendant
-        // cleanup is best-effort and not asserted here.
-        let cmd = format!("printf '%s' \"$$\" > {pid_file_arg}; sleep 30");
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
-        let output = timed_shell_output_with_timeout(
+        let shell = test_shell_path();
+        let spawned_pid = Arc::new(AtomicU32::new(0));
+        let observed_pid = Arc::clone(&spawned_pid);
+        // Observe the child immediately after spawn instead of waiting for the
+        // login shell to finish startup files and create a PID file. This keeps
+        // the timeout assertion deterministic under full-suite CPU load.
+        let output = timed_shell_output_with_timeout_observed(
             &shell,
-            &cmd,
+            "sleep 30",
             "process-group-test",
             Duration::from_millis(500),
+            move |pid| observed_pid.store(pid, Ordering::SeqCst),
         );
 
         assert!(output.is_none());
-        let pids = fs::read_to_string(pid_file).unwrap();
-        let shell_pid = pids.trim().parse::<i32>().unwrap();
-
+        let shell_pid = spawned_pid.load(Ordering::SeqCst) as i32;
+        assert!(shell_pid > 0, "resolver shell PID was not observed");
         assert!(wait_for_process_exit(shell_pid));
     }
 

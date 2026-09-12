@@ -10,10 +10,27 @@ use nix::pty::Winsize;
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::isatty;
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 
 use super::{handle_sighup, handle_sigint, handle_sigterm, handle_sigwinch};
+
+// TUI children can enable mouse tracking, focus reporting, and bracketed paste
+// on the outer terminal. Termios restoration does not reset these DEC private
+// modes, so the login shell left behind after a tool exits can receive terminal
+// reports that look like continuously typed input.
+const OUTER_TERMINAL_INPUT_MODE_RESET: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?2004l";
+
+fn reset_outer_terminal_input_modes() {
+    let stdout = io::stdout();
+    if !isatty(&stdout).unwrap_or(false) {
+        return;
+    }
+    let mut stdout = stdout.lock();
+    let _ = stdout.write_all(OUTER_TERMINAL_INPUT_MODE_RESET);
+    let _ = stdout.flush();
+}
 
 /// RAII guard that restores terminal settings on drop.
 ///
@@ -37,6 +54,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if let Some(ref termios) = self.original_termios {
             let _ = tcsetattr(io::stdin(), SetArg::TCSANOW, termios);
+            reset_outer_terminal_input_modes();
         }
     }
 }
@@ -111,4 +129,22 @@ pub fn setup_signal_handlers() -> Result<()> {
     setup_signal_handler(Signal::SIGTERM, handle_sigterm, false)?;
     setup_signal_handler(Signal::SIGHUP, handle_sighup, false)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outer_terminal_reset_disables_input_generating_modes() {
+        for mode in ["1000", "1002", "1003", "1004", "1006", "2004"] {
+            let reset = format!("\x1b[?{mode}l");
+            assert!(
+                OUTER_TERMINAL_INPUT_MODE_RESET
+                    .windows(reset.len())
+                    .any(|window| window == reset.as_bytes()),
+                "missing reset for DEC private mode {mode}"
+            );
+        }
+    }
 }

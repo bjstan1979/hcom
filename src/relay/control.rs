@@ -603,6 +603,35 @@ fn ensure_remote_action_supported(
     unreachable!()
 }
 
+/// Require an explicitly advertised cross-device protocol feature. Unlike
+/// legacy RPC actions, lifecycle guarantees must never be attempted
+/// optimistically against a peer whose capability set is unknown or old.
+pub fn require_remote_feature(
+    db: &HcomDb,
+    target_device_short_id: &str,
+    feature: &str,
+) -> Result<(), String> {
+    match read_remote_capabilities(db, target_device_short_id)? {
+        CachedCapabilities::Advertised(capabilities)
+            if capabilities.iter().any(|capability| capability == feature) =>
+        {
+            Ok(())
+        }
+        CachedCapabilities::Advertised(_) | CachedCapabilities::Legacy => Err(format!(
+            "device {target_device_short_id} does not advertise '{feature}' — advanced message lifecycle operations require a current v19 peer; use ordinary send/reply semantics with older peers"
+        )),
+        CachedCapabilities::Stale(age_secs) => {
+            let age = crate::shared::time::format_age(age_secs as i64);
+            Err(format!(
+                "device {target_device_short_id} is offline (last seen {age} ago)"
+            ))
+        }
+        CachedCapabilities::NotSynced => Err(format!(
+            "device {target_device_short_id} has not yet advertised protocol features — try again in a few seconds"
+        )),
+    }
+}
+
 fn emit_rpc_result(
     db: &HcomDb,
     request_id: &str,
@@ -821,7 +850,9 @@ fn handle_remote_kill(
         "pane_retry_command": result.pane_retry_command,
         "preset_name": result.preset_name,
         "pane_id": result.pane_id,
-        "ok": !matches!(result.kill_result, crate::terminal::KillResult::PermissionDenied),
+        "cleanup_error": result.cleanup_error,
+        "ok": !matches!(result.kill_result, crate::terminal::KillResult::PermissionDenied)
+            && result.cleanup_error.is_none(),
     }))
 }
 
@@ -1750,6 +1781,24 @@ mod tests {
         );
         assert!(check_remote_action_for_db(&db, "WXYZ", "launch", None).is_ok());
         assert!(check_remote_action_for_db(&db, "WXYZ", "kill", None).is_ok());
+    }
+
+    #[test]
+    fn test_remote_message_feature_requires_explicit_current_peer_advertisement() {
+        let db = test_db();
+        safe_kv_set(&db, "relay_short_WXYZ", Some("device-123"));
+        safe_kv_set(
+            &db,
+            "relay_caps_device-123",
+            Some(r#"["launch","message-lifecycle-v1"]"#),
+        );
+        assert!(require_remote_feature(&db, "WXYZ", "message-lifecycle-v1").is_ok());
+        let error = require_remote_feature(&db, "WXYZ", "message-attachments-v1").unwrap_err();
+        assert!(error.contains("does not advertise 'message-attachments-v1'"));
+
+        safe_kv_set(&db, "relay_caps_device-123", Some("null"));
+        let legacy_error = require_remote_feature(&db, "WXYZ", "message-lifecycle-v1").unwrap_err();
+        assert!(legacy_error.contains("ordinary send/reply semantics"));
     }
 
     #[test]

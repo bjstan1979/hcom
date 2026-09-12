@@ -240,6 +240,13 @@ pub fn run_local_resume_result(
 ///
 /// Returns `(resolved_name_for_display, prepared_plan)`. The loop form
 /// avoids re-opening the DB that the old recursive `do_resume` calls did.
+fn instance_is_live(db: &HcomDb, name: &str) -> bool {
+    db.get_instance_full(name)
+        .ok()
+        .flatten()
+        .is_some_and(|instance| instance.status != ST_INACTIVE)
+}
+
 fn resolve_name_to_plan(
     db: &HcomDb,
     name: &str,
@@ -255,7 +262,7 @@ fn resolve_name_to_plan(
     for _ in 0..8 {
         if is_session_id(&current) {
             if let Ok(Some(bound)) = db.get_session_binding(&current)
-                && matches!(db.get_instance_full(&bound), Ok(Some(_)))
+                && instance_is_live(db, &bound)
             {
                 bail!(
                     "Session {} is currently active as '{}' — run hcom kill {} first",
@@ -273,12 +280,41 @@ fn resolve_name_to_plan(
             return Ok((current, plan));
         }
 
+        // A stopped display name can itself be a later alias created by a
+        // prior broken resume. Resolve its tool-native session back to the
+        // earliest durable hcom identity before constructing the launch
+        // prompt. Also reject a second launch when that session is live under
+        // another identity.
+        if !instance_is_live(db, &current)
+            && let Ok((_tool, session_id, ..)) = load_stopped_snapshot(db, &current)
+            && !session_id.is_empty()
+        {
+            if let Ok(Some(bound)) = db.get_session_binding(&session_id)
+                && instance_is_live(db, &bound)
+                && bound != current
+            {
+                bail!(
+                    "Session {} for '{}' is currently active as '{}' — run hcom kill {} first",
+                    session_id,
+                    current,
+                    bound,
+                    bound
+                );
+            }
+            if let Ok(Some(canonical_name)) = db.find_stopped_instance_by_session_id(&session_id)
+                && canonical_name != current
+            {
+                current = canonical_name;
+                continue;
+            }
+        }
+
         if matches!(db.get_instance_full(&current), Ok(None) | Err(_))
             && crate::relay::control::split_device_suffix(&current).is_none()
             && let Some(session_id) = resolve_thread_name(&current)?
         {
             if let Ok(Some(bound)) = db.get_session_binding(&session_id)
-                && matches!(db.get_instance_full(&bound), Ok(Some(_)))
+                && instance_is_live(db, &bound)
             {
                 bail!(
                     "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
@@ -936,11 +972,18 @@ fn load_stopped_snapshot(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let session_id = snapshot
+            let stored_session_id = snapshot
                 .get("session_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let transcript_path = snapshot
+                .get("transcript_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let session_id =
+                crate::shared::identity::native_session_id_from_transcript(&tool, transcript_path)
+                    .unwrap_or(stored_session_id);
             let launch_args = snapshot
                 .get("launch_args")
                 .and_then(|v| v.as_str())
@@ -2859,6 +2902,67 @@ mod tests {
             "expected inactive agy row to be resumable, got: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn codex_resume_reclaims_earliest_identity_from_transcript_session() {
+        let db = test_db();
+        let native_id = "01a04e1f-52e7-7953-85a5-38a16546159e";
+        let transcript =
+            format!("/home/test/.codex/sessions/rollout-2026-08-29T23-24-30-{native_id}.jsonl");
+        for (name, stored_id) in [
+            ("done", "01a051f1-43bb-7193-897d-c7021553ef3d"),
+            ("puma", native_id),
+        ] {
+            let snapshot = serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "codex",
+                    "session_id": stored_id,
+                    "transcript_path": transcript,
+                    "launch_args": "[\"--ask-for-approval\",\"never\"]",
+                    "tag": "",
+                    "background": 0,
+                    "last_event_id": 0,
+                    "directory": "/tmp"
+                }
+            });
+            db.conn()
+                .execute(
+                    "INSERT INTO events (timestamp, type, instance, data) VALUES ('2026-01-01T00:00:00Z', 'life', ?1, ?2)",
+                    rusqlite::params![name, snapshot.to_string()],
+                )
+                .unwrap();
+        }
+
+        let (_, stopped_session, ..) = load_stopped_snapshot(&db, "done").unwrap();
+        assert_eq!(stopped_session, native_id);
+
+        for reference in ["puma", native_id] {
+            let (resolved, plan) =
+                resolve_name_to_plan(&db, reference, false, &[], &GlobalFlags::default()).unwrap();
+            assert_eq!(resolved, "done");
+            assert_eq!(plan.launch.name.as_deref(), Some("done"));
+            assert!(
+                plan.launch
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["resume", native_id])
+            );
+        }
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, status, tool, created_at) VALUES ('puma', ?1, 'listening', 'codex', 1.0)",
+                rusqlite::params![native_id],
+            )
+            .unwrap();
+        db.bind_session_process_atomic(native_id, "puma", None)
+            .unwrap();
+        let error = resolve_name_to_plan(&db, "done", false, &[], &GlobalFlags::default())
+            .err()
+            .expect("a live alias must block a duplicate resume");
+        assert!(error.to_string().contains("currently active as 'puma'"));
     }
 
     #[test]

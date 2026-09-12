@@ -1329,7 +1329,7 @@ fn run_pty_test_plugin_family(tool: &str, read_hook: &str) {
     //   - opencode/kilo: session is created by the delivery thread's PTY inject,
     //     logged as `delivery.bootstrap_inject`.
     //   - pi/omp: the plugin binds a session at launch, so the delivery thread
-    //     takes `delivery.opencode_skip_inject` and the plugin injects the first
+    //     takes `delivery.plugin_skip_inject` and the plugin injects the first
     //     message itself, logged as `plugin.hidden_bootstrap`. The PTY inject event
     //     never fires for this family — checking for it would always miss.
     let (bootstrap_event, bootstrap_desc) = if matches!(tool, "pi" | "omp") {

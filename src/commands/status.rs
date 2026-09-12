@@ -20,6 +20,9 @@ pub struct StatusArgs {
     /// Show recent log entries
     #[arg(long)]
     pub logs: bool,
+    /// Update bounded rich presence for the verified current instance
+    #[arg(long, value_name = "JSON")]
+    pub presence: Option<String>,
 }
 
 // ── Tool Detection ───────────────────────────────────────────────────────
@@ -197,9 +200,48 @@ fn get_agent_counts(db: &HcomDb) -> AgentCounts {
 // ── Main Entry Point ─────────────────────────────────────────────────────
 
 /// Main entry point for `hcom status` command.
-pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>) -> i32 {
+pub fn cmd_status(db: &HcomDb, args: &StatusArgs, ctx: Option<&CommandContext>) -> i32 {
     let json_mode = args.json;
     let show_logs = args.logs;
+    if let Some(presence) = &args.presence {
+        let process_id = std::env::var("HCOM_PROCESS_ID")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let codex_thread_id = std::env::var("CODEX_THREAD_ID")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let actor = match crate::cli_context::resolve_verified_actor(
+            db,
+            process_id.as_deref(),
+            codex_thread_id.as_deref(),
+        ) {
+            Ok(Some(actor)) => actor,
+            Ok(None) => {
+                eprintln!(
+                    "Error: --presence requires a verified process, session, or actor binding"
+                );
+                return 1;
+            }
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return 1;
+            }
+        };
+        if ctx
+            .and_then(|context| context.identity.as_ref())
+            .is_none_or(|identity| identity.name != actor.name)
+        {
+            eprintln!(
+                "Error: presence identity conflicts with verified actor '{}'",
+                actor.name
+            );
+            return 1;
+        }
+        if let Err(error) = crate::instances::update_instance_presence(db, &actor.name, presence) {
+            eprintln!("Error: {error}");
+            return 1;
+        }
+    }
 
     let hcom_dir = crate::paths::hcom_dir();
     let dir_exists = hcom_dir.exists();
@@ -259,6 +301,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         // Call get_update_info once to avoid inconsistent state (it has side effects)
         let update_info = crate::update::get_update_info();
         let mut result = json!({
+            "features": crate::db::MESSAGE_FEATURES,
             "version": {
                 "current": env!("CARGO_PKG_VERSION"),
                 "latest": update_info.as_ref().map(|(v, _)| v.clone()),

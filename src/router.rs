@@ -22,6 +22,7 @@ fn is_hook(name: &str) -> bool {
 
 const COMMANDS: &[&str] = &[
     "send",
+    "message",
     "list",
     "events",
     "stop",
@@ -589,27 +590,11 @@ pub fn dispatch() -> anyhow::Result<()> {
                 std::process::exit(exit_code);
             }
         }
-        Action::Command { ref cmd, ref args }
-            if matches!(
-                cmd.as_str(),
-                "send"
-                    | "list"
-                    | "stop"
-                    | "listen"
-                    | "events"
-                    | "transcript"
-                    | "config"
-                    | "status"
-                    | "bundle"
-                    | "archive"
-                    | "reset"
-                    | "hooks"
-                    | "term"
-                    | "relay"
-                    | "run"
-                    | "update"
-            ) =>
-        {
+        // `start` and `kill` are handled by the specialized branch above.
+        // Every other registered command uses the native clap dispatcher. Keep
+        // this driven by COMMANDS so adding a command cannot leave a second,
+        // silently stale allowlist at the outer router boundary.
+        Action::Command { ref cmd, ref args } if is_command(cmd) => {
             let exit_code = dispatch_native_command(cmd, args);
             if exit_code != 0 {
                 std::process::exit(exit_code);
@@ -777,8 +762,10 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     // Set hookless command status (subagent/codex/adhoc)
     crate::cli_context::set_hookless_command_status(&db, cmd, &ctx);
 
-    // Dispatch to command handler
-    let has_json = cmd_argv.iter().any(|a| a == "--json");
+    // Dispatch to command handler. Most commands have only `--json`; send and
+    // message reply override this from their parsed output mode so payload text
+    // after `--` cannot be mistaken for a machine-output flag.
+    let mut suppress_post_command_delivery = cmd_argv.iter().any(|a| a == "--json");
     /// Parse a clap Args struct from command argv, handling help/error output.
     /// Returns exit code on parse error (1 for errors, 0 for help/version).
     macro_rules! clap_parse {
@@ -805,6 +792,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         "send" => match clap_parse!(crate::commands::send::SendArgs, cmd, &cmd_argv) {
             Ok(mut args) => {
                 args.had_separator = cmd_argv.iter().any(|a| a == "--");
+                suppress_post_command_delivery = args.json || args.quiet;
                 crate::commands::send::cmd_send(&db, &args, Some(&ctx))
             }
             Err(e) => {
@@ -812,6 +800,15 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
                 if e.use_stderr() { 1 } else { 0 }
             }
         },
+        "message" => clap_dispatch!(
+            crate::commands::message::MessageArgs,
+            cmd,
+            &cmd_argv,
+            |args: crate::commands::message::MessageArgs| {
+                suppress_post_command_delivery = args.suppresses_post_command_delivery();
+                crate::commands::message::cmd_message(&db, &args, Some(&ctx))
+            }
+        ),
         "list" => clap_dispatch!(crate::commands::list::ListArgs, cmd, &cmd_argv, |args| {
             crate::commands::list::cmd_list(&db, &args, Some(&ctx))
         }),
@@ -890,11 +887,13 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }
     };
 
-    // Deliver pending messages AFTER command.
     // Deliver pending messages AFTER command for hookless codex/adhoc instances.
-    // This appends unread hcom messages to the command's stdout — keep in mind
-    // when changing output contracts or adding machine-readable modes.
-    if let Some(output) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
+    // Machine/suppressed output must never append or consume inbox messages.
+    if let Some(output) = crate::cli_context::maybe_deliver_pending_messages(
+        &db,
+        &ctx,
+        suppress_post_command_delivery,
+    ) {
         print!("{output}");
     }
 
@@ -908,6 +907,10 @@ mod tests {
 
     fn sv(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn message_lifecycle_command_is_natively_routed() {
+        assert!(COMMANDS.contains(&"message"));
     }
 
     #[test]

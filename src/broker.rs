@@ -132,6 +132,7 @@ pub fn authorize(argv: &[String]) -> bool {
             | "pi-beforetool"
             | "pi-stop"
             | "send"
+            | "message"
             | "list"
             | "events"
             | "listen"
@@ -450,6 +451,7 @@ mod tests {
     fn authorization_is_allowlist_only() {
         for argv in [
             strings(&["send", "@a", "--", "hello"]),
+            strings(&["message", "pending", "--json"]),
             strings(&["pi-beforetool", "--name", "a"]),
             strings(&["--name", "a", "status"]),
         ] {

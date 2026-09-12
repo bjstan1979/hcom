@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::db::HcomDb;
-use crate::hooks::common::stop_instance;
+use crate::hooks::common::{StopOutcome, stop_instance};
 use crate::identity;
 use crate::log::log_info;
 use crate::paths;
@@ -31,6 +31,7 @@ pub struct KillTrackedResult {
     pub pane_retry_command: Option<String>,
     pub preset_name: String,
     pub pane_id: String,
+    pub cleanup_error: Option<String>,
 }
 
 const EPERM_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
@@ -49,6 +50,28 @@ impl From<terminal::KillResult> for PaneCleanupProcessState {
             terminal::KillResult::AlreadyDead => Self::AlreadyDead,
             terminal::KillResult::PermissionDenied => Self::NotTerminated,
         }
+    }
+}
+
+fn should_cleanup_after_kill(result: terminal::KillResult) -> bool {
+    matches!(
+        result,
+        terminal::KillResult::Sent | terminal::KillResult::AlreadyDead
+    )
+}
+
+fn cleanup_stopped_instance(
+    db: &HcomDb,
+    name: &str,
+    initiator: &str,
+    result: terminal::KillResult,
+) -> Option<String> {
+    if !should_cleanup_after_kill(result) {
+        return None;
+    }
+    match stop_instance(db, name, initiator, "killed") {
+        StopOutcome::Stopped | StopOutcome::AlreadyStopped => None,
+        StopOutcome::RetryableError(error) => Some(error),
     }
 }
 
@@ -142,7 +165,7 @@ pub fn kill_tracked_instance(
     let is_headless = inst.background != 0;
     let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
         kill_instance(db, name, pid, &inst, is_headless);
-    stop_instance(db, name, initiator, "killed");
+    let cleanup_error = cleanup_stopped_instance(db, name, initiator, result);
 
     Ok(KillTrackedResult {
         target: name.to_string(),
@@ -152,6 +175,7 @@ pub fn kill_tracked_instance(
         pane_retry_command,
         preset_name,
         pane_id,
+        cleanup_error,
     })
 }
 
@@ -178,6 +202,13 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
         eprintln!(
             "Permission denied to kill process group {} for '{}'",
             pid, name
+        );
+        return Ok(1);
+    }
+    if let Some(error) = result.get("cleanup_error").and_then(|value| value.as_str()) {
+        eprintln!(
+            "Process group {} for '{}' terminated, but instance cleanup failed: {}",
+            pid, name, error
         );
         return Ok(1);
     }
@@ -363,9 +394,14 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
             }
             incomplete +=
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-            // Clean up instance
-            stop_instance(db, &inst.name, initiator, "killed");
-            println!("  To resume: hcom r {}", inst.name);
+            if should_cleanup_after_kill(result) {
+                if let Some(error) = cleanup_stopped_instance(db, &inst.name, initiator, result) {
+                    eprintln!("Failed to clean up '{}': {}", inst.name, error);
+                    failed += 1;
+                } else {
+                    println!("  To resume: hcom r {}", inst.name);
+                }
+            }
         } else {
             // No PID tracked — just clean up
             stop_instance(db, &inst.name, initiator, "killed");
@@ -413,7 +449,9 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         }
         incomplete +=
             report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-        pidtrack::remove_pid(hcom_dir, orphan.pid);
+        if should_cleanup_after_kill(result) {
+            pidtrack::remove_pid(hcom_dir, orphan.pid);
+        }
     }
 
     if killed == 0 && failed == 0 {
@@ -474,7 +512,10 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
             }
             incomplete +=
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-            stop_instance(db, &inst.name, initiator, "killed");
+            if let Some(error) = cleanup_stopped_instance(db, &inst.name, initiator, result) {
+                eprintln!("Failed to clean up '{}': {}", inst.name, error);
+                failed += 1;
+            }
         } else {
             // No PID tracked — clean up DB entry
             println!("No tracked process for '{}', stopping instance.", inst.name);
@@ -523,7 +564,9 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
         }
         incomplete +=
             report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-        pidtrack::remove_pid(hcom_dir, orphan.pid);
+        if should_cleanup_after_kill(result) {
+            pidtrack::remove_pid(hcom_dir, orphan.pid);
+        }
     }
 
     if tagged.is_empty() && tagged_orphans.is_empty() {
@@ -632,7 +675,16 @@ fn kill_single(
     let preset_name = kill_result.preset_name;
     let pane_id = kill_result.pane_id;
     let pane_retry_command = kill_result.pane_retry_command;
+    let cleanup_error = kill_result.cleanup_error;
     let result = kill_result.kill_result;
+
+    if let Some(error) = cleanup_error {
+        eprintln!(
+            "Process group {} for '{}' terminated, but instance cleanup failed: {}",
+            pid, name, error
+        );
+        return Ok(1);
+    }
 
     let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
     let exit = match result {
@@ -767,6 +819,15 @@ mod tests {
         use clap::Parser;
         let args = KillArgs::try_parse_from(["kill"]).unwrap();
         assert!(args.targets.is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_decision_covers_every_kill_result() {
+        assert!(should_cleanup_after_kill(terminal::KillResult::Sent));
+        assert!(should_cleanup_after_kill(terminal::KillResult::AlreadyDead));
+        assert!(!should_cleanup_after_kill(
+            terminal::KillResult::PermissionDenied
+        ));
     }
 
     #[test]

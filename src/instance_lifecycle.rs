@@ -812,6 +812,8 @@ mod tests {
             launch_context: None,
             name_announced: 0,
             idle_since: None,
+            endpoint_epoch: String::new(),
+            presence_json: "{}".to_string(),
         }
     }
 

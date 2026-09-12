@@ -22,6 +22,31 @@ use crate::shared::{
 /// Handled internally or are lifecycle commands.
 const STATUS_SKIP_COMMANDS: &[&str] = &["listen", "start", "stop", "kill", "reset", "status"];
 
+/// Resolve an actor only from a verified capability or live process binding.
+/// Explicit names are never used as evidence of identity.
+pub fn resolve_verified_actor(
+    db: &HcomDb,
+    process_id: Option<&str>,
+    codex_thread_id: Option<&str>,
+) -> Result<Option<crate::shared::SenderIdentity>, HcomError> {
+    if let Some(actor) = claude_actor::resolve_env_actor(db)? {
+        return Ok(Some(actor));
+    }
+    let Some(process_id) = process_id.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    identity::resolve_identity(
+        db,
+        None,
+        None,
+        None,
+        Some(process_id),
+        codex_thread_id,
+        None,
+    )
+    .map(Some)
+}
+
 /// Build a CommandContext for a CLI invocation (best-effort identity resolution).
 ///
 ///
@@ -39,16 +64,30 @@ pub fn build_ctx_for_command(
     process_id: Option<&str>,
     codex_thread_id: Option<&str>,
 ) -> Result<CommandContext, HcomError> {
-    let verified_actor = claude_actor::resolve_env_actor(db)?;
-    if let (Some(actor), Some(name)) = (verified_actor.as_ref(), explicit_name) {
-        claude_actor::ensure_explicit_matches(db, actor, name)?;
-    }
-
-    let identity = if let Some(actor) = verified_actor {
+    let capability_actor = claude_actor::resolve_env_actor(db)?;
+    let requires_verified_actor = cmd == Some("message");
+    let identity = if requires_verified_actor {
+        let verified_actor = match capability_actor {
+            Some(actor) => Some(actor),
+            None => resolve_verified_actor(db, process_id, codex_thread_id)?,
+        };
+        if let (Some(actor), Some(name)) = (verified_actor.as_ref(), explicit_name) {
+            claude_actor::ensure_explicit_matches(db, actor, name)?;
+        }
+        Some(verified_actor.ok_or_else(|| {
+            HcomError::IdentityRequired(
+                "message operations require a verified process, session, or actor binding"
+                    .to_string(),
+            )
+        })?)
+    } else if let Some(actor) = capability_actor {
+        if let Some(name) = explicit_name {
+            claude_actor::ensure_explicit_matches(db, &actor, name)?;
+        }
         Some(actor)
     } else if let Some(name) = explicit_name {
         if cmd != Some("start") {
-            // Explicit --name: propagate typed error so router can pattern-match.
+            // Explicit --name remains available for legacy/manual commands such as send.
             Some(identity::resolve_identity(
                 db,
                 Some(name),
@@ -62,10 +101,9 @@ pub fn build_ctx_for_command(
             None
         }
     } else {
-        // No explicit name: best-effort, swallow errors
+        // No explicit name: best-effort, swallow errors for legacy/manual commands.
         identity::resolve_identity(db, None, None, None, process_id, codex_thread_id, None).ok()
     };
-
     Ok(CommandContext {
         explicit_name: explicit_name.map(|s| s.to_string()),
         identity,
@@ -180,7 +218,8 @@ pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandCon
 /// For hookless instances (codex/adhoc): append unread messages after command output.
 ///
 /// Codex and adhoc instances have no delivery hooks, so messages are delivered
-/// via CLI command output. Skips for --json output to preserve machine-readable format.
+/// via CLI command output. Suppressed/machine output modes skip delivery so their
+/// stdout contracts and inbox cursors remain unchanged.
 ///
 /// Not display-only: also advances the instance cursor and updates delivery status.
 /// This is the hookless counterpart to hook-based delivery.
@@ -189,9 +228,9 @@ pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandCon
 pub fn maybe_deliver_pending_messages(
     db: &HcomDb,
     ctx: &CommandContext,
-    has_json_flag: bool,
+    suppress_delivery: bool,
 ) -> Option<String> {
-    if has_json_flag {
+    if suppress_delivery {
         return None;
     }
 
@@ -465,64 +504,17 @@ fn format_hook_messages_simple_from_msgs(
     messages: &[crate::db::Message],
     instance_name: &str,
 ) -> String {
-    if messages.is_empty() {
-        return String::new();
-    }
-
-    let recipient_display = identity::get_display_name(db, instance_name);
-
-    if messages.len() == 1 {
-        let msg = &messages[0];
-        let prefix = build_message_prefix(
-            msg.intent.as_deref(),
-            msg.thread.as_deref(),
-            msg.event_id,
-            &serde_json::json!({}),
-        );
-        let sender_display = identity::get_display_name(db, &msg.from);
-
-        let others = msg
-            .delivered_to
-            .as_ref()
-            .map(|a| a.len().saturating_sub(1))
-            .unwrap_or(0);
-        let recipient = if others > 0 {
-            let plural = if others > 1 { "s" } else { "" };
-            format!("{recipient_display} (+{others} other{plural})")
-        } else {
-            recipient_display
-        };
-
-        format!("{prefix} {sender_display} → {recipient}: {}", msg.text)
-    } else {
-        let parts: Vec<String> = messages
-            .iter()
-            .map(|msg| {
-                let prefix = build_message_prefix(
-                    msg.intent.as_deref(),
-                    msg.thread.as_deref(),
-                    msg.event_id,
-                    &serde_json::json!({}),
-                );
-                let sender_display = identity::get_display_name(db, &msg.from);
-
-                let others = msg
-                    .delivered_to
-                    .as_ref()
-                    .map(|a| a.len().saturating_sub(1))
-                    .unwrap_or(0);
-                let recipient = if others > 0 {
-                    format!("{recipient_display} (+{others})")
-                } else {
-                    recipient_display.clone()
-                };
-
-                format!("{prefix} {sender_display} → {recipient}: {}", msg.text)
-            })
-            .collect();
-
-        format!("[{} new messages] | {}", parts.len(), parts.join(" | "))
-    }
+    let values: Vec<serde_json::Value> = messages
+        .iter()
+        .map(crate::hooks::common::message_to_value)
+        .collect();
+    crate::messages::format_hook_messages(
+        &values,
+        instance_name,
+        &|name| db.get_instance(name).ok().flatten(),
+        &String::new,
+        None,
+    )
 }
 
 #[cfg(test)]

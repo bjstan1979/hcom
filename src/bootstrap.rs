@@ -708,6 +708,7 @@ mod tests {
         );
 
         assert!(result.contains("Messages instantly and automatically arrive"));
+        assert!(result.contains("MUST use `hcom <cmd+flags> --name nova`"));
         assert!(!result.contains("SUBAGENTS")); // Not claude
     }
 

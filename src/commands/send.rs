@@ -2,17 +2,18 @@
 
 use std::io::{IsTerminal, Read as IoRead};
 
-use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
+use crate::db::{HcomDb, MESSAGE_PROTOCOL_V1, MessagePersistInput, MessagePersistResult};
 use crate::identity;
 use crate::instances;
 use crate::messages::{
-    InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,
-    validate_intent, validate_message,
+    InstanceInfo, MAX_PROTOCOL_PAYLOAD_BYTES, MessageEnvelope, MessageScope, compute_scope,
+    should_deliver_message, validate_intent, validate_message,
 };
 use crate::shared::{
     CommandContext, SENDER, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon,
 };
+use rusqlite::OptionalExtension;
 
 const SEND_AFTER_HELP: &str = "\
 Target matching:
@@ -84,6 +85,9 @@ pub struct SendArgs {
     #[arg(long)]
     pub intent: Option<String>,
 
+    /// Reply consumption for requests: inbox (default) or wait
+    #[arg(long, value_parser = ["inbox", "wait"])]
+    pub reply_mode: Option<String>,
     /// Reply to event ID (42 or 42:BOXE)
     #[arg(long)]
     pub reply_to: Option<String>,
@@ -101,9 +105,17 @@ pub struct SendArgs {
     #[arg(short = 'b')]
     pub bigboss: bool,
 
-    /// Suppress output
+    /// Suppress human-readable output and inbox consumption
     #[arg(long)]
     pub quiet: bool,
+
+    /// Emit exact machine-readable send result
+    #[arg(long)]
+    pub json: bool,
+
+    /// Inline UTF-8 snippet/context attachment as a JSON object (repeatable)
+    #[arg(long = "attachment")]
+    pub attachments: Vec<String>,
 
     // ── Inline bundle ──
     /// Bundle title (creates inline bundle)
@@ -234,6 +246,21 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
         }
     }
     format!("Sent to: {}", parts.join(", "))
+}
+fn envelope_has_data(envelope: &MessageEnvelope) -> bool {
+    envelope.intent.is_some()
+        || envelope.reply_to.is_some()
+        || envelope.thread.is_some()
+        || envelope.bundle_id.is_some()
+        || envelope.message_id.is_some()
+        || envelope.correlation_id.is_some()
+        || envelope.in_reply_to.is_some()
+        || envelope.expects_reply
+        || envelope.reply_endpoint.is_some()
+        || envelope.delivery_endpoint.is_some()
+        || envelope.supersedes.is_some()
+        || envelope.retry_of.is_some()
+        || !envelope.attachments.is_empty()
 }
 
 struct ResolvedDelivery {
@@ -373,22 +400,239 @@ fn print_broadcast_preview(db: &HcomDb, delivered_to: &[String]) {
 }
 
 ///
+/// Derive lifecycle linkage for the documented legacy ack form when its event
+/// target has a projected V1 request. Schema-18-only events deliberately return
+/// `None` and retain the legacy event-target behavior.
+fn derive_projected_reply(
+    db: &HcomDb,
+    identity: &SenderIdentity,
+    envelope: &mut MessageEnvelope,
+) -> Result<Option<String>, String> {
+    if envelope.intent.as_ref().map(|intent| intent.as_str()) != Some("ack") {
+        return Ok(None);
+    }
+    let Some(reply_to) = envelope.reply_to.as_deref() else {
+        return Ok(None);
+    };
+    let Some(local_event_id) = resolve_reply_to_local(db, reply_to) else {
+        return Ok(None);
+    };
+    let projected = db
+        .conn()
+        .query_row(
+            "SELECT mr.message_id, mr.correlation_id, mr.sender_name,
+                    json_extract(events.data, '$.thread'),
+                    COALESCE(json_extract(events.data, '$.reply_mode'), 'inbox')
+             FROM message_records mr
+             JOIN events ON events.id = mr.event_id
+             WHERE mr.event_id = ?1",
+            rusqlite::params![local_event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Failed to inspect reply target: {error}"))?;
+    let Some((request_id, correlation_id, request_sender, request_thread, reply_mode)) = projected
+    else {
+        return Ok(None);
+    };
+    let delivery_endpoint = match reply_mode.as_str() {
+        "inbox" => "inbox".to_string(),
+        "wait" => format!("request:{request_id}"),
+        other => return Err(format!("projected request has invalid reply mode: {other}")),
+    };
+    if !matches!(identity.kind, SenderKind::Instance) {
+        return Err("projected request replies require an instance recipient identity".to_string());
+    }
+    let authorized = db
+        .conn()
+        .query_row(
+            "SELECT 1 FROM message_deliveries
+             WHERE message_id = ?1 AND recipient_name = ?2",
+            rusqlite::params![request_id, identity.name],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("Failed to authorize reply target: {error}"))?
+        .is_some();
+    if !authorized {
+        return Err("reply actor is not a recipient of the request".to_string());
+    }
+    if envelope
+        .in_reply_to
+        .as_deref()
+        .is_some_and(|value| value != request_id)
+        || envelope
+            .correlation_id
+            .as_deref()
+            .is_some_and(|value| value != correlation_id)
+        || envelope
+            .delivery_endpoint
+            .as_deref()
+            .is_some_and(|value| value != delivery_endpoint.as_str())
+    {
+        return Err("reply lifecycle linkage conflicts with the projected request".to_string());
+    }
+    if let (Some(request_thread), Some(reply_thread)) =
+        (request_thread.as_deref(), envelope.thread.as_deref())
+        && request_thread != reply_thread
+    {
+        return Err("reply thread must match the projected request".to_string());
+    }
+    envelope.in_reply_to = Some(request_id.clone());
+    envelope.correlation_id = Some(correlation_id);
+    envelope.delivery_endpoint = Some(delivery_endpoint);
+    if envelope.thread.is_none() {
+        envelope.thread = request_thread;
+    }
+    Ok(Some(request_sender))
+}
+
+fn requires_bounded_protocol_payload(envelope: Option<&MessageEnvelope>) -> bool {
+    envelope.is_some_and(|env| {
+        !env.attachments.is_empty()
+            || env.message_id.is_some()
+            || env.correlation_id.is_some()
+            || env.in_reply_to.is_some()
+            || env.expects_reply
+            || env.reply_endpoint.is_some()
+            || env.delivery_endpoint.is_some()
+            || env.supersedes.is_some()
+            || env.retry_of.is_some()
+    })
+}
+
+///
 /// Validates message, computes scope, logs event, notifies all instances.
-/// Returns delivered_to list (base names).
+/// Returns exact event/message identities and recipient endpoint snapshots.
 pub fn send_message(
     db: &HcomDb,
     identity: &SenderIdentity,
     message: &str,
     envelope: Option<&MessageEnvelope>,
     explicit_targets: Option<&[String]>,
-) -> Result<Vec<String>, String> {
+) -> Result<MessagePersistResult, String> {
     validate_message(message)?;
 
-    let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
+    let mut effective_envelope = envelope.cloned();
+    let projected_reply_sender = effective_envelope
+        .as_mut()
+        .map(|env| derive_projected_reply(db, identity, env))
+        .transpose()?
+        .flatten();
+    let effective_envelope_ref = effective_envelope.as_ref();
+    let delivery = if let Some(request_sender) = projected_reply_sender {
+        if explicit_targets.is_some() {
+            let requested = resolve_delivery(
+                db,
+                identity,
+                message,
+                effective_envelope_ref,
+                explicit_targets,
+            )?;
+            if requested.delivered_to != [request_sender.clone()] {
+                return Err("reply must address exactly the original request sender".to_string());
+            }
+        }
+        resolve_delivery(
+            db,
+            identity,
+            message,
+            effective_envelope_ref,
+            Some(&[request_sender]),
+        )?
+    } else {
+        resolve_delivery(
+            db,
+            identity,
+            message,
+            effective_envelope_ref,
+            explicit_targets,
+        )?
+    };
+    let envelope = effective_envelope_ref;
     let scope_str = delivery.effective_scope.as_str();
+    let generated_message_id = uuid::Uuid::new_v4().to_string();
+    let message_id = envelope
+        .and_then(|env| env.message_id.as_deref())
+        .unwrap_or(&generated_message_id)
+        .to_string();
+    let correlation_id = if let Some(value) = envelope.and_then(|env| env.correlation_id.as_deref())
+    {
+        value.to_string()
+    } else if let Some(target) = envelope.and_then(|env| env.in_reply_to.as_deref()) {
+        db.conn()
+            .query_row(
+                "SELECT correlation_id FROM message_records WHERE message_id = ?1",
+                rusqlite::params![target],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| "Reply target not found".to_string())?
+    } else {
+        message_id.clone()
+    };
+    let expects_reply = envelope.is_some_and(|env| {
+        env.expects_reply
+            || env
+                .intent
+                .as_ref()
+                .is_some_and(|intent| intent.as_str() == "request")
+    });
+    let reply_endpoint = envelope
+        .and_then(|env| env.reply_endpoint.clone())
+        .or_else(|| expects_reply.then(|| format!("request:{message_id}")));
+    let delivery_endpoint = envelope
+        .and_then(|env| env.delivery_endpoint.as_deref())
+        .unwrap_or("inbox")
+        .to_string();
 
+    let lifecycle_guarantee = expects_reply
+        || envelope.is_some_and(|env| {
+            env.message_id.is_some()
+                || env.correlation_id.is_some()
+                || env.in_reply_to.is_some()
+                || env.supersedes.is_some()
+                || env.retry_of.is_some()
+                || env.reply_endpoint.is_some()
+                || env
+                    .delivery_endpoint
+                    .as_deref()
+                    .is_some_and(|endpoint| endpoint != "inbox")
+        });
+    let attachment_guarantee = envelope.is_some_and(|env| !env.attachments.is_empty());
+    if lifecycle_guarantee || attachment_guarantee {
+        for recipient in &delivery.delivered_to {
+            let Some((_, device_short_id)) = recipient.rsplit_once(':') else {
+                continue;
+            };
+            if lifecycle_guarantee {
+                crate::relay::control::require_remote_feature(
+                    db,
+                    device_short_id,
+                    "message-lifecycle-v1",
+                )?;
+            }
+            if attachment_guarantee {
+                crate::relay::control::require_remote_feature(
+                    db,
+                    device_short_id,
+                    "message-attachments-v1",
+                )?;
+            }
+        }
+    }
     // Build event data
     let mut data = serde_json::json!({
+        "protocol": MESSAGE_PROTOCOL_V1,
+        "message_id": message_id,
+        "correlation_id": correlation_id,
         "from": identity.name,
         "sender_kind": match identity.kind {
             SenderKind::External => "external",
@@ -398,6 +642,8 @@ pub fn send_message(
         "scope": scope_str,
         "text": message,
         "delivered_to": delivery.delivered_to.clone(),
+        "expects_reply": expects_reply,
+        "delivery_endpoint": delivery_endpoint,
     });
 
     // Add scope extra data (mentions)
@@ -408,6 +654,9 @@ pub fn send_message(
     if let Some(env) = envelope {
         if let Some(intent) = &env.intent {
             data["intent"] = serde_json::json!(intent.as_str());
+        }
+        if let Some(reply_mode) = &env.reply_mode {
+            data["reply_mode"] = serde_json::json!(reply_mode);
         }
         if let Some(reply_to) = &env.reply_to {
             data["reply_to"] = serde_json::json!(reply_to);
@@ -434,6 +683,21 @@ pub fn send_message(
         if let Some(bundle_id) = &env.bundle_id {
             data["bundle_id"] = serde_json::json!(bundle_id);
         }
+        if let Some(in_reply_to) = &env.in_reply_to {
+            data["in_reply_to"] = serde_json::json!(in_reply_to);
+        }
+        if let Some(supersedes) = &env.supersedes {
+            data["supersedes"] = serde_json::json!(supersedes);
+        }
+        if let Some(retry_of) = &env.retry_of {
+            data["retry_of"] = serde_json::json!(retry_of);
+        }
+        if !env.attachments.is_empty() {
+            data["attachments"] = serde_json::json!(env.attachments);
+        }
+    }
+    if let Some(endpoint) = &reply_endpoint {
+        data["reply_endpoint"] = serde_json::json!(endpoint);
     }
 
     // Determine routing instance (namespace isolation)
@@ -443,11 +707,40 @@ pub fn send_message(
         SenderKind::Instance => identity.name.clone(),
     };
 
-    // Log event to DB
-    let _event_id = db
-        .log_event("message", &routing_instance, &data)
+    let attachments_json = serde_json::to_string(
+        &envelope
+            .map(|env| env.attachments.as_slice())
+            .unwrap_or_default(),
+    )
+    .map_err(|error| format!("Failed to encode attachments: {error}"))?;
+    let encoded_len = serde_json::to_vec(&data)
+        .map_err(|error| format!("Failed to encode message: {error}"))?
+        .len();
+    if requires_bounded_protocol_payload(envelope) && encoded_len >= MAX_PROTOCOL_PAYLOAD_BYTES {
+        return Err(format!(
+            "Complete message payload is too large ({encoded_len} bytes, must be below {MAX_PROTOCOL_PAYLOAD_BYTES})"
+        ));
+    }
+    let result = db
+        .persist_message_v1(&MessagePersistInput {
+            routing_instance: &routing_instance,
+            sender_name: &identity.name,
+            sender_session_id: identity.session_id.as_deref(),
+            data: &data,
+            message_id: &message_id,
+            correlation_id: &correlation_id,
+            intent: envelope.and_then(|env| env.intent.as_ref().map(|value| value.as_str())),
+            expects_reply,
+            in_reply_to: envelope.and_then(|env| env.in_reply_to.as_deref()),
+            legacy_reply_to: envelope.and_then(|env| env.reply_to.as_deref()),
+            reply_endpoint: reply_endpoint.as_deref(),
+            delivery_endpoint: &delivery_endpoint,
+            supersedes: envelope.and_then(|env| env.supersedes.as_deref()),
+            retry_of: envelope.and_then(|env| env.retry_of.as_deref()),
+            attachments_json: &attachments_json,
+            recipients: &delivery.delivered_to,
+        })
         .map_err(|e| format!("Failed to write message to database: {e}"))?;
-
     // Auto-create request-watch subscriptions for targeted requests
     if let Some(env) = envelope {
         if let Some(thread) = env.thread.as_deref() {
@@ -463,7 +756,7 @@ pub fn send_message(
             && delivery.effective_scope == MessageScope::Mentions
             && !delivery.is_thread_resolved
         {
-            create_request_watches(db, &identity.name, _event_id, &delivery.delivered_to);
+            create_request_watches(db, &identity.name, result.event_id, &delivery.delivered_to);
         }
     }
 
@@ -473,26 +766,40 @@ pub fn send_message(
     // Trigger relay push so remote devices see the message immediately
     crate::relay::trigger_push();
 
-    Ok(delivery.delivered_to)
+    Ok(result)
 }
-
 /// Resolve reply_to to local event ID. Returns None if not found.
 fn resolve_reply_to_local(db: &HcomDb, reply_to: &str) -> Option<i64> {
     // reply_to can be "42" or "42:BOXE" (remote)
-    let local_part = reply_to.split(':').next()?;
-    let id: i64 = local_part.parse().ok()?;
+    let (id_part, remote_short) = reply_to
+        .split_once(':')
+        .map_or((reply_to, None), |(id, short)| (id, Some(short)));
+    let id: i64 = id_part.parse().ok()?;
+    if let Some(short) = remote_short {
+        if short.is_empty() {
+            return None;
+        }
+        return db
+            .conn()
+            .query_row(
+                "SELECT id FROM events
+                 WHERE type = 'message'
+                   AND CAST(json_extract(data, '$._relay.id') AS INTEGER) = ?1
+                   AND json_extract(data, '$._relay.short') = ?2
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![id, short],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok();
+    }
 
-    // Verify event exists and is a message
-    let exists: bool = db
-        .conn()
+    db.conn()
         .query_row(
-            "SELECT 1 FROM events WHERE id = ? AND type = 'message'",
+            "SELECT id FROM events WHERE id = ?1 AND type = 'message'",
             rusqlite::params![id],
-            |_| Ok(true),
+            |row| row.get::<_, i64>(0),
         )
-        .unwrap_or(false);
-
-    if exists { Some(id) } else { None }
+        .ok()
 }
 
 /// Get thread from an event (for --reply-to thread inheritance).
@@ -731,7 +1038,27 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         envelope.intent = val.parse().ok();
     }
 
+    let is_request = envelope.intent.as_ref().map(|intent| intent.as_str()) == Some("request");
+    if args.reply_mode.is_some() && !is_request {
+        eprintln!("Error: --reply-mode is valid only with --intent request");
+        return 1;
+    }
+    if is_request {
+        envelope.reply_mode = Some(
+            args.reply_mode
+                .clone()
+                .unwrap_or_else(|| "inbox".to_string()),
+        );
+    }
+
     envelope.reply_to = args.reply_to.clone();
+    envelope.attachments = match crate::messages::normalize_attachments(&args.attachments) {
+        Ok(attachments) => attachments,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return 1;
+        }
+    };
 
     if let Some(ref val) = args.thread {
         if val.len() > 64 {
@@ -877,8 +1204,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             None
         };
 
-    let preview_has_envelope =
-        envelope.intent.is_some() || envelope.reply_to.is_some() || envelope.thread.is_some();
+    let preview_has_envelope = envelope_has_data(&envelope);
     let preview_delivery = match resolve_delivery(
         db,
         &sender_identity,
@@ -1007,24 +1333,35 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     // ── Send message ──
-    let has_envelope = envelope.intent.is_some()
-        || envelope.reply_to.is_some()
-        || envelope.thread.is_some()
-        || envelope.bundle_id.is_some();
-
-    let delivered_to = match send_message(
+    let has_envelope = envelope_has_data(&envelope);
+    let send_result = match send_message(
         db,
         &sender_identity,
         &message,
         if has_envelope { Some(&envelope) } else { None },
         targets_to_pass,
     ) {
-        Ok(d) => d,
+        Ok(result) => result,
         Err(e) => {
             eprintln!("Error: {e}");
             return 1;
         }
     };
+    let delivered_to = &send_result.delivered_to;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event_id": send_result.event_id,
+                "message_id": &send_result.message_id,
+                "delivered_to": &send_result.delivered_to,
+                "recipient_endpoint_epochs": &send_result.recipient_endpoint_epochs,
+            })
+        );
+        crate::relay::worker::ensure_worker(true);
+        return 0;
+    }
 
     // ── Feedback ──
     if args.quiet {
@@ -1032,8 +1369,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         return 0;
     }
 
-    let feedback = get_recipient_feedback(db, &delivered_to);
-
+    let feedback = get_recipient_feedback(db, delivered_to);
     // Show unread messages if instance context (full delivery with cursor advance)
     if matches!(sender_identity.kind, SenderKind::Instance) {
         let messages = db.get_unread_messages(&sender_identity.name);
@@ -1229,6 +1565,22 @@ mod tests {
                 .unwrap();
         assert_eq!(args.intent.as_deref(), Some("request"));
         assert_eq!(args.positionals, vec!["@luna"]);
+    }
+
+    #[test]
+    fn parse_explicit_blocking_reply_mode() {
+        let args = SendArgs::try_parse_from([
+            "send",
+            "--intent",
+            "request",
+            "--reply-mode",
+            "wait",
+            "@luna",
+            "--",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(args.reply_mode.as_deref(), Some("wait"));
     }
 
     #[test]
@@ -1460,6 +1812,362 @@ mod tests {
 
     #[test]
     #[serial]
+    fn advanced_remote_message_requires_current_peer_feature() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (
+                    name, status, endpoint_epoch, origin_device_id, created_at
+                 ) VALUES
+                    ('alice', 'active', 'epoch-alice', NULL, 1.0),
+                    ('bob:WXYZ', 'active', 'epoch-bob', 'device-remote', 1.0)",
+                [],
+            )
+            .unwrap();
+        crate::relay::safe_kv_set(&db, "relay_short_WXYZ", Some("device-remote"));
+        crate::relay::safe_kv_set(&db, "relay_caps_device-remote", Some("null"));
+        let identity = SenderIdentity {
+            name: "alice".to_string(),
+            kind: SenderKind::Instance,
+            session_id: None,
+            instance_data: None,
+        };
+        let envelope = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Request),
+            expects_reply: true,
+            ..Default::default()
+        };
+        let error = send_message(
+            &db,
+            &identity,
+            "question",
+            Some(&envelope),
+            Some(&["bob:WXYZ".to_string()]),
+        )
+        .unwrap_err();
+        assert!(error.contains("ordinary send/reply semantics"));
+        assert_eq!(db.get_last_event_id(), 0);
+
+        crate::relay::safe_kv_set(
+            &db,
+            "relay_caps_device-remote",
+            Some(r#"["message-lifecycle-v1"]"#),
+        );
+        let sent = send_message(
+            &db,
+            &identity,
+            "question",
+            Some(&envelope),
+            Some(&["bob:WXYZ".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(sent.delivered_to, ["bob:WXYZ"]);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_ack_to_projected_request_derives_stable_linkage_and_authorizes_recipient() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, endpoint_epoch, created_at)
+                 VALUES ('alice', 'active', 'epoch-alice', 1.0),
+                        ('bob', 'active', 'epoch-bob', 1.0),
+                        ('carol', 'active', 'epoch-carol', 1.0)",
+                [],
+            )
+            .unwrap();
+        let alice = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "alice".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let bob = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "bob".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let carol = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "carol".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let request = send_message(
+            &db,
+            &alice,
+            "question",
+            Some(&MessageEnvelope {
+                intent: Some(crate::messages::MessageIntent::Request),
+                correlation_id: Some("legacy-correlation".into()),
+                thread: Some("legacy-thread".into()),
+                ..Default::default()
+            }),
+            Some(&["bob".to_string()]),
+        )
+        .unwrap();
+        let legacy_ack = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Ack),
+            reply_to: Some(request.event_id.to_string()),
+            ..Default::default()
+        };
+
+        let unauthorized = send_message(
+            &db,
+            &carol,
+            "not my request",
+            Some(&legacy_ack),
+            Some(&["alice".to_string()]),
+        )
+        .unwrap_err();
+        assert!(unauthorized.contains("not a recipient"));
+
+        let reply = send_message(
+            &db,
+            &bob,
+            "answer",
+            Some(&legacy_ack),
+            Some(&["alice".to_string()]),
+        )
+        .unwrap();
+        let request_id = request.message_id;
+        let inspection = db.inspect_message_v1(&reply.message_id).unwrap();
+        assert_eq!(inspection["message"]["in_reply_to"], request_id);
+        assert_eq!(
+            inspection["message"]["correlation_id"],
+            "legacy-correlation"
+        );
+        assert_eq!(inspection["message"]["thread"], "legacy-thread");
+        assert_eq!(inspection["deliveries"][0]["delivery_endpoint"], "inbox");
+        assert!(
+            db.get_unread_messages("alice")
+                .iter()
+                .any(|message| message.message_id.as_deref() == Some(&reply.message_id)),
+            "ordinary legacy ack must preserve upstream inbox wake delivery"
+        );
+        assert_eq!(
+            db.inspect_message_v1(&request_id).unwrap()["deliveries"][0]["state"],
+            "replied"
+        );
+        let watches: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(watches, 0);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_plain_text_send_preserves_one_mib_baseline_above_protocol_cap() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, endpoint_epoch, created_at)
+                 VALUES ('alice', 'active', 'epoch-alice', 1.0),
+                        ('bob', 'active', 'epoch-bob', 1.0)",
+                [],
+            )
+            .unwrap();
+        let alice = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "alice".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let text = "x".repeat(100 * 1024);
+        let sent = send_message(&db, &alice, &text, None, Some(&["bob".to_string()])).unwrap();
+        assert_eq!(
+            db.inspect_message_v1(&sent.message_id).unwrap()["message"]["text"],
+            text
+        );
+        let advanced = send_message(
+            &db,
+            &alice,
+            &text,
+            Some(&MessageEnvelope {
+                correlation_id: Some("explicit-correlation".into()),
+                ..Default::default()
+            }),
+            Some(&["bob".to_string()]),
+        )
+        .unwrap_err();
+        assert!(advanced.contains("Complete message payload is too large"));
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn schema_18_legacy_reply_target_keeps_event_fallback() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, endpoint_epoch, created_at)
+                 VALUES ('alice', 'active', 'epoch-alice', 1.0),
+                        ('bob', 'active', 'epoch-bob', 1.0)",
+                [],
+            )
+            .unwrap();
+        let parent_event = db
+            .log_event(
+                "message",
+                "alice",
+                &serde_json::json!({
+                    "from": "alice",
+                    "sender_kind": "instance",
+                    "scope": "mentions",
+                    "mentions": ["bob"],
+                    "delivered_to": ["bob"],
+                    "intent": "request",
+                    "thread": "legacy-thread",
+                    "text": "legacy request"
+                }),
+            )
+            .unwrap();
+        let bob = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "bob".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let reply = send_message(
+            &db,
+            &bob,
+            "legacy answer",
+            Some(&MessageEnvelope {
+                intent: Some(crate::messages::MessageIntent::Ack),
+                reply_to: Some(parent_event.to_string()),
+                thread: Some("legacy-thread".into()),
+                ..Default::default()
+            }),
+            Some(&["alice".to_string()]),
+        )
+        .unwrap();
+        let inspection = db.inspect_message_v1(&reply.message_id).unwrap();
+        assert!(inspection["message"]["in_reply_to"].is_null());
+        assert_eq!(inspection["message"]["reply_to_local"], parent_event);
+        assert_eq!(inspection["deliveries"][0]["delivery_endpoint"], "inbox");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn remote_reply_id_does_not_collide_with_same_local_event_id() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, timestamp, type, instance, data)
+                 VALUES (42, '2026-01-01T00:00:00Z', 'message', 'alice', ?1)",
+                rusqlite::params![
+                    serde_json::json!({
+                        "from": "alice",
+                        "text": "local",
+                        "scope": "broadcast"
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        let remote_local_id = db
+            .log_event(
+                "message",
+                "bob:BOXE",
+                &serde_json::json!({
+                    "from": "bob:BOXE",
+                    "text": "remote",
+                    "scope": "broadcast",
+                    "_relay": {"id": 42, "short": "BOXE"}
+                }),
+            )
+            .unwrap();
+        assert_eq!(resolve_reply_to_local(&db, "42"), Some(42));
+        assert_eq!(
+            resolve_reply_to_local(&db, "42:BOXE"),
+            Some(remote_local_id)
+        );
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn envelope_presence_includes_every_lifecycle_field() {
+        let mut envelope = MessageEnvelope::default();
+        assert!(!envelope_has_data(&envelope));
+        envelope.expects_reply = true;
+        assert!(envelope_has_data(&envelope));
+        envelope = MessageEnvelope {
+            message_id: Some("stable".into()),
+            correlation_id: Some("correlation".into()),
+            in_reply_to: Some("parent".into()),
+            reply_endpoint: Some("request:stable".into()),
+            delivery_endpoint: Some("request:parent".into()),
+            supersedes: Some("old".into()),
+            retry_of: Some("attempt".into()),
+            ..Default::default()
+        };
+        assert!(envelope_has_data(&envelope));
+    }
+
+    #[test]
+    #[serial]
+    fn quiet_and_json_send_do_not_advance_sender_cursor() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, status, created_at)
+                 VALUES ('alice', 'session-alice', 'active', 1.0),
+                        ('bob', 'session-bob', 'active', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "message",
+            "bob",
+            &serde_json::json!({
+                "from": "bob",
+                "sender_kind": "instance",
+                "scope": "mentions",
+                "mentions": ["alice"],
+                "delivered_to": ["alice"],
+                "text": "unread"
+            }),
+        )
+        .unwrap();
+        let ctx = CommandContext {
+            explicit_name: None,
+            identity: Some(SenderIdentity {
+                kind: SenderKind::Instance,
+                name: "alice".into(),
+                instance_data: Some(serde_json::json!({"session_id": "session-alice"})),
+                session_id: Some("session-alice".into()),
+            }),
+            go: true,
+        };
+        for output_flag in ["--quiet", "--json"] {
+            let mut args =
+                SendArgs::try_parse_from(["send", output_flag, "@bob", "--", "lifecycle send"])
+                    .unwrap();
+            args.had_separator = true;
+            assert_eq!(cmd_send(&db, &args, Some(&ctx)), 0);
+            assert_eq!(
+                db.get_instance_status("alice")
+                    .unwrap()
+                    .unwrap()
+                    .last_event_id,
+                0
+            );
+        }
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
     fn send_message_threads_seed_and_reuse_memberships() {
         let (db, path, _env) = setup_test_db();
         db.conn()
@@ -1488,7 +2196,10 @@ mod tests {
             Some(&["nova".to_string(), "miso".to_string()]),
         )
         .unwrap();
-        assert_eq!(delivered, vec!["nova".to_string(), "miso".to_string()]);
+        assert_eq!(
+            delivered.delivered_to,
+            vec!["nova".to_string(), "miso".to_string()]
+        );
 
         let members = db.get_thread_members("debate-1");
         assert_eq!(
@@ -1497,7 +2208,10 @@ mod tests {
         );
 
         let delivered = send_message(&db, &sender, "round 2", Some(&envelope), None).unwrap();
-        assert_eq!(delivered, vec!["nova".to_string(), "miso".to_string()]);
+        assert_eq!(
+            delivered.delivered_to,
+            vec!["nova".to_string(), "miso".to_string()]
+        );
 
         cleanup_test_db(path);
     }
@@ -1560,7 +2274,7 @@ mod tests {
             Some(&["nova".to_string()]),
         )
         .unwrap();
-        assert_eq!(delivered, vec!["nova".to_string()]);
+        assert_eq!(delivered.delivered_to, vec!["nova".to_string()]);
         assert_eq!(db.get_thread_members("ops"), vec!["nova".to_string()]);
 
         cleanup_test_db(path);
@@ -1603,7 +2317,7 @@ mod tests {
         };
         let delivered =
             send_message(&db, &sender, "status?", Some(&request_envelope), None).unwrap();
-        assert_eq!(delivered, vec!["nova".to_string()]);
+        assert_eq!(delivered.delivered_to, vec!["nova".to_string()]);
 
         let reqwatch_count: i64 = db
             .conn()

@@ -23,6 +23,29 @@ pub fn is_launching_placeholder(data: &InstanceRow) -> bool {
         && (data.status == ST_INACTIVE || data.status == "pending")
 }
 
+pub const MAX_PRESENCE_JSON_BYTES: usize = 4096;
+
+/// Store bounded rich presence alongside the normal heartbeat row. The actor
+/// name is resolved by the caller; no sender name is accepted from payload.
+pub fn update_instance_presence(db: &HcomDb, name: &str, presence: &str) -> Result<(), String> {
+    if presence.len() > MAX_PRESENCE_JSON_BYTES {
+        return Err(format!(
+            "presence JSON is too large (max {MAX_PRESENCE_JSON_BYTES} bytes)"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(presence)
+        .map_err(|error| format!("invalid presence JSON: {error}"))?;
+    if !value.is_object() {
+        return Err("presence JSON must be an object".to_string());
+    }
+    let canonical =
+        serde_json::to_string(&value).map_err(|error| format!("invalid presence JSON: {error}"))?;
+    let mut updates = serde_json::Map::new();
+    updates.insert("presence_json".to_string(), serde_json::json!(canonical));
+    db.update_instance_fields(name, &updates)
+        .map_err(|error| format!("failed to update presence: {error}"))
+}
+
 /// Update instance position atomically.
 /// If instance doesn't exist, UPDATE silently affects 0 rows.
 pub fn update_instance_position(
@@ -42,12 +65,15 @@ pub fn update_instance_position(
         }
     }
 
-    if let Err(e) = db.update_instance_fields(name, &update_copy) {
-        crate::log::log_error(
-            "core",
-            "db.error",
-            &format!("update_instance_position: {} - {}", name, e),
-        );
+    match db.update_instance_fields(name, &update_copy) {
+        Ok(()) => {}
+        Err(e) => {
+            crate::log::log_error(
+                "core",
+                "db.error",
+                &format!("update_instance_position: {} - {}", name, e),
+            );
+        }
     }
 }
 
@@ -116,6 +142,8 @@ mod tests {
             launch_context: None,
             name_announced: 0,
             idle_since: None,
+            endpoint_epoch: String::new(),
+            presence_json: "{}".to_string(),
         }
     }
 

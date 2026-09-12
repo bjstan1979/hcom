@@ -49,6 +49,24 @@ impl SenderIdentity {
     }
 }
 
+/// Return the tool-native durable session identifier encoded by a transcript path.
+///
+/// Codex rollout filenames end with the canonical thread UUID even when an older
+/// hcom instance snapshot still carries its launch-time placeholder session ID.
+/// Treat that filename UUID as authoritative so resume can reclaim the original
+/// hcom identity instead of allocating a new four-letter alias.
+pub fn native_session_id_from_transcript(tool: &str, transcript_path: &str) -> Option<String> {
+    if tool != "codex" {
+        return None;
+    }
+    let stem = transcript_path.strip_suffix(".jsonl")?;
+    const UUID_TEXT_LEN: usize = 36;
+    let start = stem.len().checked_sub(UUID_TEXT_LEN)?;
+    let candidate = stem.get(start..)?;
+    uuid::Uuid::parse_str(candidate).ok()?;
+    Some(candidate.to_string())
+}
+
 /// Resolved identity context for a single CLI invocation.
 #[derive(Debug, Clone)]
 pub struct CommandContext {
@@ -59,7 +77,6 @@ pub struct CommandContext {
     /// Whether --go flag was provided.
     pub go: bool,
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +144,21 @@ mod tests {
             session_id: None,
         };
         assert_eq!(empty.group_id(), None);
+    }
+
+    #[test]
+    fn codex_transcript_exposes_native_session_id() {
+        let id = "01a04e1f-52e7-7953-85a5-38a16546159e";
+        let path =
+            format!("/home/test/.codex/sessions/2026/08/29/rollout-2026-08-29T23-24-30-{id}.jsonl");
+        assert_eq!(
+            native_session_id_from_transcript("codex", &path).as_deref(),
+            Some(id)
+        );
+        assert_eq!(native_session_id_from_transcript("claude", &path), None);
+        assert_eq!(
+            native_session_id_from_transcript("codex", "rollout-invalid.jsonl"),
+            None
+        );
     }
 }

@@ -268,8 +268,9 @@ fn start_from_orphan(
         instance_names::generate_unique_name(db)?
     };
 
-    // Core DB registration
-    let _ = pidtrack::recover_single_orphan_to_db(db, orphan, &name);
+    // Core DB registration must succeed before pid tracking is removed or any
+    // success event/output is emitted. On failure the orphan remains retryable.
+    pidtrack::recover_single_orphan_to_db(db, orphan, &name).map_err(anyhow::Error::msg)?;
 
     db.log_event(
         "life",
@@ -534,7 +535,7 @@ fn start_rebind(
         &target_name,
         tool,
         false,
-        false,
+        ctx.is_launched,
         &ctx.notes,
         &hcom_config.tag,
         relay::is_relay_enabled(&hcom_config),
@@ -932,6 +933,20 @@ mod tests {
         )
         .unwrap();
     }
+    #[test]
+    fn rebind_bootstrap_preserves_launched_delivery_mode() {
+        let source = include_str!("start.rs");
+        let start = source
+            .find("// Print bootstrap")
+            .expect("rebind bootstrap block");
+        let end = source[start..]
+            .find("println!(\"[hcom:{}]\"")
+            .expect("bootstrap print");
+        let block = &source[start..start + end];
+        assert!(block.contains("ctx.is_launched"));
+        assert!(!block.contains("tool,\n        false,\n        false,"));
+    }
+
     #[test]
     fn test_start_args_bare() {
         let args = StartArgs::try_parse_from(["start"]).unwrap();

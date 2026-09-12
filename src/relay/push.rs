@@ -24,7 +24,7 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
     let instances = match db.conn().prepare(
         "SELECT name, status, status_context, status_detail, status_time, parent_name,
                 directory, transcript_path,
-                wait_timeout, last_stop, tcp_mode, tag, tool, background
+                wait_timeout, last_stop, tcp_mode, tag, tool, background, endpoint_epoch
          FROM instances WHERE COALESCE(origin_device_id, '') = ''",
     ) {
         Ok(mut stmt) => {
@@ -45,6 +45,7 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
                         row.get::<_, Option<String>>(11)?, // tag
                         row.get::<_, Option<String>>(12)?, // tool
                         row.get::<_, Option<bool>>(13)?,   // background
+                        row.get::<_, String>(14)?,         // endpoint_epoch
                     ))
                 })
                 .ok()
@@ -75,6 +76,7 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
                         "tool": row.12.as_deref().unwrap_or("claude"),
                         "background": row.13.unwrap_or(false),
                         "detail": row.3.as_deref().unwrap_or(""),
+                        "endpoint_epoch": row.14,
                     }),
                 );
             }
@@ -99,8 +101,9 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
         .flatten()
         .and_then(|ts| parse_iso_timestamp_to_epoch(&ts))
         .unwrap_or(0.0);
-    let capabilities = json!(super::control::advertised_remote_capabilities());
-
+    let mut capabilities = super::control::advertised_remote_capabilities();
+    capabilities.extend(crate::db::MESSAGE_FEATURES.iter().copied());
+    let capabilities = json!(capabilities);
     json!({
         "instances": instances,
         "short_id": short_id,
@@ -294,5 +297,29 @@ mod tests {
                 .iter()
                 .any(|event| event["id"].as_i64() == Some(recent_id))
         );
+    }
+
+    #[test]
+    fn build_state_advertises_message_features_and_endpoint_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, endpoint_epoch, created_at)
+                 VALUES ('alice', 'active', 'epoch-alice', 1.0)",
+                [],
+            )
+            .unwrap();
+
+        let state = build_state(&db, "device-a");
+        assert_eq!(state["instances"]["alice"]["endpoint_epoch"], "epoch-alice");
+        let capabilities = state["capabilities"].as_array().unwrap();
+        for feature in crate::db::MESSAGE_FEATURES {
+            assert!(
+                capabilities
+                    .iter()
+                    .any(|value| value.as_str() == Some(feature))
+            );
+        }
     }
 }

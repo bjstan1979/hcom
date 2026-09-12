@@ -2,7 +2,9 @@
 
 use crate::shared::{MAX_MESSAGE_SIZE, SENDER, extract_mentions};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -69,13 +71,134 @@ impl std::str::FromStr for MessageIntent {
     }
 }
 
-/// Optional envelope fields for messages.
+pub const MAX_ATTACHMENTS: usize = 8;
+pub const MAX_ATTACHMENT_BYTES: usize = 16 * 1024;
+pub const MAX_ATTACHMENTS_TOTAL_BYTES: usize = 64 * 1024;
+pub const MAX_PROTOCOL_PAYLOAD_BYTES: usize = 96 * 1024;
+const ATTACHMENT_CLI_HINT: &str = "Each --attachment value must be one JSON object, not an array; repeat --attachment for multiple items. Example: --attachment '{\"type\":\"snippet\",\"name\":\"note.txt\",\"content\":\"hello\"}'";
+
+/// Bounded UTF-8 attachment stored directly in the message event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageAttachment {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub byte_count: usize,
+    pub sha256: String,
+    pub content: String,
+}
+
+/// Optional envelope fields for messages. New lifecycle-aware sends populate
+/// stable IDs while retaining the legacy event-ID aliases.
 #[derive(Debug, Clone, Default)]
 pub struct MessageEnvelope {
     pub intent: Option<MessageIntent>,
     pub reply_to: Option<String>,
     pub thread: Option<String>,
     pub bundle_id: Option<String>,
+    pub message_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub in_reply_to: Option<String>,
+    pub expects_reply: bool,
+    pub reply_endpoint: Option<String>,
+    /// Reply consumption mode requested by a request sender: `inbox` (default,
+    /// preserves ordinary HCOM wake/injection) or `wait` (exclusive blocking
+    /// `message wait` consumer).
+    pub reply_mode: Option<String>,
+    pub delivery_endpoint: Option<String>,
+    pub supersedes: Option<String>,
+    pub retry_of: Option<String>,
+    pub attachments: Vec<MessageAttachment>,
+}
+
+/// Parse and normalize repeated `--attachment` JSON objects. Hash and size
+/// metadata are broker-computed; caller-provided values are ignored.
+pub fn normalize_attachments(raw: &[String]) -> Result<Vec<MessageAttachment>, String> {
+    if raw.len() > MAX_ATTACHMENTS {
+        return Err(format!("Too many attachments (max {MAX_ATTACHMENTS})"));
+    }
+    let mut total = 0usize;
+    let mut normalized = Vec::with_capacity(raw.len());
+    for (index, item) in raw.iter().enumerate() {
+        let position = index + 1;
+        let value: Value = serde_json::from_str(item).map_err(|error| {
+            format!("Invalid attachment #{position} JSON: {error}. {ATTACHMENT_CLI_HINT}")
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            format!("Attachment #{position} must be a JSON object. {ATTACHMENT_CLI_HINT}")
+        })?;
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Attachment requires type".to_string())?;
+        if kind == "workspace_file" {
+            return Err(
+                "workspace_file attachments are unsupported in V1 core; use snippet/context"
+                    .to_string(),
+            );
+        }
+        if !matches!(kind, "snippet" | "context") {
+            return Err(format!("Unsupported attachment type: {kind}"));
+        }
+        let content = object
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Attachment requires UTF-8 content".to_string())?;
+        if content.chars().any(|ch| {
+            ('\u{0000}'..='\u{0008}').contains(&ch)
+                || ('\u{000b}'..='\u{000c}').contains(&ch)
+                || ('\u{000e}'..='\u{001f}').contains(&ch)
+                || ('\u{0080}'..='\u{009f}').contains(&ch)
+        }) {
+            return Err("Attachment content contains control characters".to_string());
+        }
+        let bytes = content.as_bytes();
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "Attachment too large ({} bytes, max {MAX_ATTACHMENT_BYTES})",
+                bytes.len()
+            ));
+        }
+        total = total
+            .checked_add(bytes.len())
+            .ok_or_else(|| "Attachment size overflow".to_string())?;
+        if total > MAX_ATTACHMENTS_TOTAL_BYTES {
+            return Err(format!(
+                "Attachments too large in aggregate ({total} bytes, max {MAX_ATTACHMENTS_TOTAL_BYTES})"
+            ));
+        }
+        let name = object.get("name").and_then(Value::as_str).unwrap_or(kind);
+        if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+            return Err("Attachment name must be 1-256 printable characters".to_string());
+        }
+        let bounded_optional = |field: &str, max: usize| -> Result<Option<String>, String> {
+            let Some(value) = object.get(field) else {
+                return Ok(None);
+            };
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("Attachment {field} must be a string"))?;
+            if value.len() > max || value.chars().any(char::is_control) {
+                return Err(format!("Attachment {field} is too long or invalid"));
+            }
+            Ok((!value.is_empty()).then(|| value.to_string()))
+        };
+        let digest = Sha256::digest(bytes);
+        normalized.push(MessageAttachment {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            mime: bounded_optional("mime", 128)?,
+            language: bounded_optional("language", 64)?,
+            byte_count: bytes.len(),
+            sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+            content: content.to_string(),
+        });
+    }
+    Ok(normalized)
 }
 
 /// Relay metadata for cross-device messages.
@@ -528,6 +651,64 @@ fn build_message_prefix(msg: &Value) -> String {
         format!("[{}]", prefix)
     }
 }
+fn format_protocol_details(msg: &Value, instance_name: &str) -> Option<String> {
+    let message_id = msg.get("message_id").and_then(Value::as_str);
+    let attachments = msg
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if message_id.is_none() && attachments.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    if let Some(message_id) = message_id {
+        lines.push(format!("[hcom-message id={message_id}]"));
+    }
+    for attachment in attachments {
+        let kind = attachment
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("attachment");
+        let name = attachment
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(kind);
+        let sha256 = attachment
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let byte_count = attachment
+            .get("byte_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        lines.push(format!(
+            "[attachment {kind}:{name} bytes={byte_count} sha256={sha256}]"
+        ));
+        if let Some(content) = attachment.get("content").and_then(Value::as_str) {
+            lines.push(content.to_string());
+        }
+    }
+
+    let expects_reply = msg
+        .get("expects_reply")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if msg.get("intent").and_then(Value::as_str) == Some("request")
+        && expects_reply
+        && let Some(message_id) = message_id
+    {
+        lines.push(format!(
+            "Reply with stable message ID: hcom --name {instance_name} message reply {message_id} -- '<text>'"
+        ));
+        lines.push(
+            "For attachments, repeat --attachment '<one JSON object>' before --; never pass a JSON array."
+                .to_string(),
+        );
+    }
+    Some(lines.join("\n"))
+}
 
 /// Format messages for hook feedback.
 ///
@@ -612,6 +793,14 @@ pub fn format_hook_messages(
     }
     if !hints.is_empty() {
         result = format!("{} | [{}]", result, hints);
+    }
+    let protocol_details: Vec<String> = messages
+        .iter()
+        .filter_map(|msg| format_protocol_details(msg, instance_name))
+        .collect();
+    if !protocol_details.is_empty() {
+        result.push('\n');
+        result.push_str(&protocol_details.join("\n"));
     }
 
     // Show recv:thread tip on first receipt in each thread
@@ -1372,6 +1561,51 @@ mod tests {
         assert!(result.contains("hello there"));
         assert!(result.contains("#42"));
     }
+    #[test]
+    fn lifecycle_request_format_is_self_contained_for_hook_agents() {
+        let msgs = vec![serde_json::json!({
+            "from": "naga",
+            "message": "verify this",
+            "event_id": 13541,
+            "message_id": "4ad4b291-44ae-4149-bb7b-184aa68f64a2",
+            "intent": "request",
+            "expects_reply": true,
+            "delivered_to": ["done"],
+            "attachments": [{
+                "type": "snippet",
+                "name": "probe.txt",
+                "byte_count": 5,
+                "sha256": "abc123",
+                "content": "hello"
+            }]
+        })];
+
+        let result = format_hook_messages(&msgs, "done", &|_name| None, &String::new, None);
+        assert!(result.contains("[hcom-message id=4ad4b291-44ae-4149-bb7b-184aa68f64a2]"));
+        assert!(result.contains("[attachment snippet:probe.txt bytes=5 sha256=abc123]"));
+        assert!(result.contains("\nhello\n"));
+        assert!(
+            result.contains("hcom --name done message reply 4ad4b291-44ae-4149-bb7b-184aa68f64a2")
+        );
+        assert!(result.contains("one JSON object"));
+        assert!(result.contains("never pass a JSON array"));
+    }
+
+    #[test]
+    fn lifecycle_inform_format_does_not_suggest_a_reply() {
+        let msgs = vec![serde_json::json!({
+            "from": "naga",
+            "message": "fyi",
+            "event_id": 7,
+            "message_id": "inform-id",
+            "intent": "inform",
+            "expects_reply": false,
+            "delivered_to": ["done"]
+        })];
+        let result = format_hook_messages(&msgs, "done", &|_name| None, &String::new, None);
+        assert!(result.contains("[hcom-message id=inform-id]"));
+        assert!(!result.contains("Reply with stable message ID"));
+    }
 
     #[test]
     fn test_format_hook_messages_multiple() {
@@ -1773,5 +2007,78 @@ mod tests {
         assert!(!is_external_sender_data(
             &serde_json::json!({"parent_session_id": "parent-sess"})
         ));
+    }
+
+    #[test]
+    fn attachments_enforce_count_size_and_control_bounds() {
+        let valid = || serde_json::json!({"type": "snippet", "content": "ok"}).to_string();
+        let too_many = (0..=MAX_ATTACHMENTS).map(|_| valid()).collect::<Vec<_>>();
+        assert!(
+            normalize_attachments(&too_many)
+                .unwrap_err()
+                .contains("Too many")
+        );
+        let array_error = normalize_attachments(&["[]".to_string()]).unwrap_err();
+        assert!(array_error.contains("must be a JSON object"));
+        assert!(array_error.contains("not an array"));
+        assert!(array_error.contains("repeat --attachment"));
+        assert!(array_error.contains("note.txt"));
+
+        let oversized = [serde_json::json!({
+            "type": "snippet",
+            "content": "x".repeat(MAX_ATTACHMENT_BYTES + 1)
+        })
+        .to_string()];
+        assert!(
+            normalize_attachments(&oversized)
+                .unwrap_err()
+                .contains("too large")
+        );
+
+        let aggregate = (0..5)
+            .map(|_| {
+                serde_json::json!({"type": "context", "content": "x".repeat(14_000)}).to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            normalize_attachments(&aggregate)
+                .unwrap_err()
+                .contains("aggregate")
+        );
+
+        let control =
+            [serde_json::json!({"type": "snippet", "content": "bad\u{0001}"}).to_string()];
+        assert!(
+            normalize_attachments(&control)
+                .unwrap_err()
+                .contains("control")
+        );
+    }
+
+    #[test]
+    fn workspace_file_attachments_fail_closed_and_metadata_is_broker_computed() {
+        let workspace = [serde_json::json!({
+            "type": "workspace_file",
+            "name": "secret.txt",
+            "content": "ignored"
+        })
+        .to_string()];
+        assert!(
+            normalize_attachments(&workspace)
+                .unwrap_err()
+                .contains("unsupported")
+        );
+
+        let normalized = normalize_attachments(&[serde_json::json!({
+            "type": "context",
+            "name": "safe.txt",
+            "content": "line one\nline two",
+            "byte_count": 999_999,
+            "sha256": "caller-controlled"
+        })
+        .to_string()])
+        .unwrap();
+        assert_eq!(normalized[0].byte_count, "line one\nline two".len());
+        assert_ne!(normalized[0].sha256, "caller-controlled");
     }
 }

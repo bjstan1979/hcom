@@ -49,6 +49,8 @@ pub struct InstanceRow {
     pub launch_context: Option<String>,
     pub name_announced: i64,
     pub idle_since: Option<String>,
+    pub endpoint_epoch: String,
+    pub presence_json: String,
 }
 
 impl InstanceRow {
@@ -123,6 +125,12 @@ impl InstanceRow {
             idle_since: row
                 .get::<_, Option<String>>("idle_since")?
                 .filter(|s| !s.is_empty()),
+            endpoint_epoch: row
+                .get::<_, Option<String>>("endpoint_epoch")?
+                .unwrap_or_default(),
+            presence_json: row
+                .get::<_, Option<String>>("presence_json")?
+                .unwrap_or_else(|| "{}".to_string()),
         })
     }
 }
@@ -136,8 +144,7 @@ pub(super) const INSTANCE_COLUMNS: &str =
      background_log_file, name_announced, agent_id,
      origin_device_id, hints, subagent_timeout, tool, launch_args,
      terminal_preset_requested, terminal_preset_effective,
-     idle_since, pid, launch_context";
-
+     idle_since, pid, launch_context, endpoint_epoch, presence_json";
 impl HcomDb {
     /// Get instance status by name
     ///
@@ -500,23 +507,41 @@ impl HcomDb {
             .unwrap_or(false)
     }
 
-    /// Find the most recent stopped instance whose snapshot carries the given
-    /// session_id. life.stopped events are the source of truth: they persist
-    /// across the `session_bindings` cascade, so they're the right thing to
-    /// consult when reclaiming hcom identity by UUID after stop/kill.
+    /// Find the canonical stopped identity for a durable native session.
+    ///
+    /// The earliest association wins. A session resume must not let a later
+    /// launch placeholder become a new identity. For Codex, also inspect the
+    /// transcript filename because older snapshots could retain an hcom
+    /// launch-time session UUID while the rollout filename carried the actual
+    /// Codex thread UUID.
     pub fn find_stopped_instance_by_session_id(&self, session_id: &str) -> Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT instance FROM events
-                 WHERE type = 'life'
-                   AND json_extract(data, '$.action') = 'stopped'
-                   AND json_extract(data, '$.snapshot.session_id') = ?
-                 ORDER BY id DESC LIMIT 1",
-                params![session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(Into::into)
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT instance,
+                    COALESCE(json_extract(data, '$.snapshot.session_id'), ''),
+                    COALESCE(json_extract(data, '$.snapshot.tool'), ''),
+                    COALESCE(json_extract(data, '$.snapshot.transcript_path'), '')
+             FROM events
+             WHERE type = 'life'
+               AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (instance, stored_session_id, tool, transcript_path) = row?;
+            let native_session_id =
+                crate::shared::identity::native_session_id_from_transcript(&tool, &transcript_path);
+            if stored_session_id == session_id || native_session_id.as_deref() == Some(session_id) {
+                return Ok(Some(instance));
+            }
+        }
+        Ok(None)
     }
 
     /// Convert a row from INSTANCE_COLUMNS SELECT to JSON.
@@ -553,6 +578,10 @@ impl HcomDb {
             "idle_since": row.get::<_, String>(28).unwrap_or_default(),
             "pid": row.get::<_, Option<i64>>(29).unwrap_or(None),
             "launch_context": row.get::<_, String>(30).unwrap_or_default(),
+            "endpoint_epoch": row.get::<_, String>(31).unwrap_or_default(),
+            "presence": row.get::<_, String>(32).ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .unwrap_or_else(|| serde_json::json!({})),
         }))
     }
 
@@ -745,6 +774,16 @@ impl HcomDb {
             placeholders.push("?");
             values.push(Self::json_value_to_sql(val));
         }
+        if !data.contains_key("endpoint_epoch")
+            && data
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        {
+            cols.push("endpoint_epoch");
+            placeholders.push("?");
+            values.push(Box::new(uuid::Uuid::new_v4().to_string()));
+        }
 
         let sql = format!(
             "INSERT OR REPLACE INTO instances ({}) VALUES ({})",
@@ -799,10 +838,35 @@ impl HcomDb {
             return Ok(());
         }
 
+        let mut effective_updates = updates.clone();
+        if !updates.contains_key("endpoint_epoch")
+            && let Some(new_session) = updates
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+            && !new_session.is_empty()
+        {
+            let current = self
+                .conn
+                .query_row(
+                    "SELECT session_id, endpoint_epoch FROM instances WHERE name = ?1",
+                    params![name],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if current.as_ref().is_none_or(|(session, epoch)| {
+                session.as_deref() != Some(new_session) || epoch.is_empty()
+            }) {
+                effective_updates.insert(
+                    "endpoint_epoch".to_string(),
+                    serde_json::json!(uuid::Uuid::new_v4().to_string()),
+                );
+            }
+        }
+
         let mut set_parts = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        for (key, val) in updates {
+        for (key, val) in &effective_updates {
             set_parts.push(format!("{} = ?", Self::validate_column(key)?));
             values.push(Self::json_value_to_sql(val));
         }
@@ -853,6 +917,8 @@ impl HcomDb {
             "idle_since",
             "terminal_preset_requested",
             "terminal_preset_effective",
+            "endpoint_epoch",
+            "presence_json",
         ];
         if VALID_COLUMNS.contains(&key) {
             Ok(key)
@@ -1158,6 +1224,46 @@ mod tests {
         assert_eq!(instances[0]["name"], "luna");
         assert_eq!(instances[1]["name"], "nova");
 
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn stopped_codex_native_session_keeps_earliest_identity() {
+        let (db, db_path) = setup_full_test_db();
+        let native_id = "01a04e1f-52e7-7953-85a5-38a16546159e";
+        let transcript =
+            format!("/home/test/.codex/sessions/rollout-2026-08-29T23-24-30-{native_id}.jsonl");
+        for (name, stored_id) in [
+            ("done", "01a051f1-43bb-7193-897d-c7021553ef3d"),
+            ("puma", native_id),
+        ] {
+            let data = serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "session_id": stored_id,
+                    "tool": "codex",
+                    "transcript_path": transcript,
+                }
+            });
+            db.conn()
+                .execute(
+                    "INSERT INTO events (timestamp, type, instance, data) VALUES ('2026-01-01T00:00:00Z', 'life', ?1, ?2)",
+                    params![name, data.to_string()],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            db.find_stopped_instance_by_session_id(native_id)
+                .unwrap()
+                .as_deref(),
+            Some("done")
+        );
+        assert_eq!(
+            db.find_stopped_instance_by_session_id("01a051f1-43bb-7193-897d-c7021553ef3d")
+                .unwrap()
+                .as_deref(),
+            Some("done")
+        );
         cleanup_test_db(db_path);
     }
 }

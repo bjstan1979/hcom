@@ -22,8 +22,7 @@ static DANGEROUS_CHARS_WITH_AT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[|&;$`<>@]").unwrap());
 
 /// Commands that require a resolved identity to operate.
-const REQUIRE_IDENTITY: &[&str] = &["send", "listen"];
-
+const REQUIRE_IDENTITY: &[&str] = &["send", "listen", "message"];
 /// Check if value looks like a UUID (agent_id format).
 pub fn looks_like_uuid(value: &str) -> bool {
     UUID_PATTERN.is_match(value)
@@ -968,6 +967,8 @@ mod tests {
             launch_context: None,
             name_announced: 0,
             idle_since: None,
+            endpoint_epoch: String::new(),
+            presence_json: "{}".to_string(),
         }
     }
 

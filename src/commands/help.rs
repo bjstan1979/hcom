@@ -47,7 +47,10 @@ const EVENTS_HELP: &[HelpEntry] = &[
     ),
     ("", ""),
     ("Query:", ""),
-    ("  events", "Last 20 events as JSON"),
+    (
+        "  events [--json]",
+        "Last 20 events as NDJSON; --json is accepted for compatibility",
+    ),
     ("  --last N", "Limit count (default: 20)"),
     ("  --all", "Include archived sessions"),
     ("  --wait [SEC]", "Block until match (default: 60s)"),
@@ -225,6 +228,10 @@ const SEND_HELP: &[HelpEntry] = &[
     ("", "  request: expect a response"),
     ("", "  inform: FYI, no response needed"),
     ("", "  ack: replying to a request (requires --reply-to)"),
+    (
+        "  --reply-mode <mode>",
+        "For requests: inbox (default, wake sender) | wait (exclusive message wait)",
+    ),
     ("  --reply-to <id>", "Link to event ID (42 or 42:BOXE)"),
     (
         "  --thread <name>",
@@ -238,6 +245,20 @@ const SEND_HELP: &[HelpEntry] = &[
     ("Sender:", ""),
     ("  --from <name>", "External sender identity (alias: -b)"),
     ("  --name <name>", "Your identity (agent name or UUID)"),
+    ("", ""),
+    ("Machine and lifecycle output:", ""),
+    (
+        "  --json",
+        "Exact event/message IDs and recipient endpoint epochs; never consumes inbox",
+    ),
+    (
+        "  --quiet",
+        "Suppress human feedback and never consumes inbox",
+    ),
+    (
+        "  --attachment <json>",
+        "Bounded UTF-8 snippet/context attachment; repeatable",
+    ),
     ("", ""),
     ("Inline bundle (attach structured context):", ""),
     ("  --title <text>", "Create and attach bundle inline"),
@@ -265,6 +286,57 @@ const SEND_HELP: &[HelpEntry] = &[
     ("  hcom send @luna <<'EOF'", ""),
     ("  Multi-line message with special chars", ""),
     ("  EOF", ""),
+];
+
+const MESSAGE_HELP: &[HelpEntry] = &[
+    (
+        "message wait <message-uuid|event-id> [--timeout SEC] [--json]",
+        "Wait for the exact correlated reply",
+    ),
+    (
+        "message pending [--json]",
+        "List unresolved inbound requests addressed to you",
+    ),
+    (
+        "message reply <message-uuid|event-id> [--json] [--quiet] [--attachment <json>] -- <text>",
+        "Reply as a verified request recipient; JSON takes precedence over quiet",
+    ),
+    (
+        "message cancel <message-uuid|event-id> [--json]",
+        "Cancel or request cancellation",
+    ),
+    (
+        "message supersede <message-uuid|event-id> [--json] -- <text>",
+        "Replace and supersede a message",
+    ),
+    (
+        "message retry <message-uuid|event-id> [--json]",
+        "Explicitly retry as a new message attempt",
+    ),
+    (
+        "message receipt <message-uuid|event-id> --state <state> --endpoint-epoch <epoch> [--json]",
+        "Append a recipient-authenticated receipt",
+    ),
+    (
+        "message inspect <message-uuid|event-id> [--json]",
+        "Inspect canonical data and delivery states",
+    ),
+    (
+        "",
+        "Prefer the stable message UUID shown as id=<uuid>; an authorized local #event-id is also accepted.",
+    ),
+    (
+        "",
+        "Lifecycle commands use the verified identity. Hook agents should pass --name <exact-identity> before message.",
+    ),
+    (
+        "",
+        "Each --attachment is one JSON object, never an array; repeat the flag for multiple attachments.",
+    ),
+    (
+        "",
+        "Example: hcom --name done message reply <uuid> --attachment '{\"type\":\"snippet\",\"name\":\"note.txt\",\"content\":\"hello\"}' -- 'Verified'",
+    ),
 ];
 
 const BUNDLE_HELP: &[HelpEntry] = &[
@@ -835,6 +907,7 @@ fn format_entries(entries: &[HelpEntry]) -> Vec<String> {
 /// The `command_names_covers_released_tools` test guards against drift.
 pub const COMMAND_NAMES: &[&str] = &[
     "send",
+    "message",
     "list",
     "events",
     "stop",
@@ -913,6 +986,7 @@ Launch:\n\
 \n\
 Commands:\n\
   send         Send message to your buddies\n\
+  message      Inspect and control durable message lifecycle\n\
   listen       Block until message or event arrives\n\
   list         Show agents, status, unread counts\n\
   events       Query event stream, manage subscriptions\n\
@@ -1032,6 +1106,7 @@ pub fn get_command_help(name: &str) -> String {
     let entries: Option<&[HelpEntry]> = match name {
         "list" => Some(LIST_HELP),
         "send" => Some(SEND_HELP),
+        "message" => Some(MESSAGE_HELP),
         "bundle" => Some(BUNDLE_HELP),
         "stop" => Some(STOP_HELP),
         "start" => Some(START_HELP),
@@ -1143,6 +1218,7 @@ mod tests {
     fn all_commands_have_help() {
         let commands = [
             "send",
+            "message",
             "list",
             "events",
             "stop",
@@ -1191,6 +1267,23 @@ mod tests {
             help.contains("Subscribe"),
             "events sub help should contain Subscribe section"
         );
+    }
+
+    #[test]
+    fn lifecycle_help_exposes_machine_safe_paths() {
+        let send = get_command_help("send");
+        for flag in ["--json", "--quiet", "--attachment"] {
+            assert!(send.contains(flag), "send help omitted {flag}");
+        }
+        let message = get_command_help("message");
+        assert!(message.contains("message pending"));
+        assert!(message.contains("message receipt"));
+        assert!(message.contains("message-uuid|event-id"));
+        assert!(message.contains("--name <exact-identity>"));
+        assert!(message.contains("one JSON object, never an array"));
+        assert!(message.contains("hcom --name done message reply"));
+        let events = get_command_help("events");
+        assert!(events.contains("events [--json]"));
     }
 
     #[test]

@@ -608,19 +608,27 @@ pub(crate) fn process_logged_event(
                 .unwrap_or("");
             let sub_caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
             if request_id > 0 && !target.is_empty() {
-                let waterline: i64 = db
-                    .conn
-                    .query_row(
-                        "SELECT last_event_id FROM instances WHERE name = ?",
-                        params![target],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                if waterline < request_id {
-                    let mut sub_mut = sub.clone();
-                    sub_mut["last_id"] = serde_json::json!(event_id);
-                    kv_store_sub(db, key, &sub_mut);
-                    continue;
+                let target_stopped = event_type == "life"
+                    && data.get("action").and_then(|v| v.as_str()) == Some("stopped");
+                // Hard finalization deletes the live row before publishing
+                // life.stopped. That terminal event is authoritative and must
+                // bypass the live-instance waterline gate even when an older
+                // producer omitted snapshot.last_event_id.
+                if !target_stopped {
+                    let waterline: i64 = db
+                        .conn
+                        .query_row(
+                            "SELECT last_event_id FROM instances WHERE name = ?",
+                            params![target],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(0);
+                    if waterline < request_id {
+                        let mut sub_mut = sub.clone();
+                        sub_mut["last_id"] = serde_json::json!(event_id);
+                        kv_store_sub(db, key, &sub_mut);
+                        continue;
+                    }
                 }
 
                 if reqwatch_reply_exists(db, request_id, target, sub_caller) {
@@ -1036,13 +1044,58 @@ fn format_sub_notification(
     parts.join(" | ")
 }
 
+fn durable_session_identity(db: &HcomDb, instance: &str) -> Option<String> {
+    let choose = |tool: &str, session_id: &str, transcript_path: &str| {
+        crate::shared::identity::native_session_id_from_transcript(tool, transcript_path)
+            .or_else(|| (!session_id.is_empty()).then(|| session_id.to_string()))
+    };
+    if let Ok(Some(row)) = db.get_instance_full(instance)
+        && let Some(identity) = choose(
+            &row.tool,
+            row.session_id.as_deref().unwrap_or(""),
+            &row.transcript_path,
+        )
+    {
+        return Some(identity);
+    }
+    let snapshot: String = db
+        .conn
+        .query_row(
+            "SELECT data FROM events
+             WHERE type = 'life'
+               AND instance = ?1
+               AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id DESC LIMIT 1",
+            params![instance],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let data: serde_json::Value = serde_json::from_str(&snapshot).ok()?;
+    let snapshot = data.get("snapshot")?;
+    choose(
+        snapshot
+            .get("tool")
+            .and_then(|value| value.as_str())
+            .unwrap_or(""),
+        snapshot
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or(""),
+        snapshot
+            .get("transcript_path")
+            .and_then(|value| value.as_str())
+            .unwrap_or(""),
+    )
+}
+
 fn find_collision_partner(
     db: &HcomDb,
     event_id: i64,
     instance: &str,
     file_path: &str,
 ) -> Option<String> {
-    db.conn
+    let partner: String = db
+        .conn
         .query_row(
             &format!(
                 "SELECT e.instance FROM events_v e
@@ -1059,7 +1112,11 @@ fn find_collision_partner(
             params![file_path, instance, event_id],
             |row| row.get::<_, String>(0),
         )
-        .ok()
+        .ok()?;
+    let same_durable_session = durable_session_identity(db, instance)
+        .zip(durable_session_identity(db, &partner))
+        .is_some_and(|(left, right)| left == right);
+    (!same_durable_session).then_some(partner)
 }
 
 fn send_sub_notification(db: &HcomDb, caller: &str, message: &str) -> bool {
@@ -1269,6 +1326,64 @@ mod tests {
                 .is_none(),
             "once sub should be removed after notify"
         );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_finalize_instance_stop_notifies_reqwatch_once_after_live_row_delete() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "nabe", "antigravity");
+        let sub_key = format!("events_sub:reqwatch-{request_id}-nabe");
+        let responder = db.get_instance_full("nabe").unwrap().unwrap();
+        let snapshot = db.get_instance_snapshot("nabe").unwrap().unwrap();
+        assert_eq!(snapshot["last_event_id"].as_i64(), Some(request_id));
+        let event_data = serde_json::json!({
+            "action": "stopped",
+            "by": "test",
+            "reason": "finalize-regression",
+            "snapshot": snapshot,
+        });
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+
+        assert!(
+            db.finalize_instance_stop(
+                "nabe",
+                responder.created_at,
+                responder.session_id.as_deref(),
+                responder.agent_id.as_deref(),
+                &event_data,
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.finalize_instance_stop(
+                "nabe",
+                responder.created_at,
+                responder.session_id.as_deref(),
+                responder.agent_id.as_deref(),
+                &event_data,
+            )
+            .unwrap(),
+            "repeated finalization must lose the identity CAS"
+        );
+
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before + 1,
+            "the consumed unanswered request must emit exactly one notice"
+        );
+        assert!(db.kv_get(&sub_key).unwrap().is_none());
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = 'nabe'
+                   AND json_extract(data, '$.action') = 'stopped'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 1);
         cleanup_test_db(db_path);
     }
 
@@ -1516,6 +1631,67 @@ mod tests {
         assert!(sql.contains("< 30"));
         assert!(!sql.contains("tool:edit_file"));
         assert!(!sql.contains("< 20"));
+    }
+
+    #[test]
+    fn collision_ignores_codex_aliases_of_same_native_session() {
+        let (db, db_path) = setup_full_test_db();
+        let native_id = "01a04e1f-52e7-7953-85a5-38a16546159e";
+        let transcript =
+            format!("/home/test/.codex/sessions/rollout-2026-08-29T23-24-30-{native_id}.jsonl");
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, session_id, status, tool, transcript_path, created_at)
+                 VALUES ('puma', ?1, 'active', 'codex', ?2, 1.0)",
+                params![native_id, transcript],
+            )
+            .unwrap();
+        let stopped = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "session_id": "01a051f1-43bb-7193-897d-c7021553ef3d",
+                "tool": "codex",
+                "transcript_path": transcript,
+            }
+        });
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', 'done', ?2)",
+                params!["2026-08-29T15:35:00Z", stopped.to_string()],
+            )
+            .unwrap();
+        let edit = serde_json::json!({
+            "status": "active",
+            "context": "tool:apply_patch",
+            "detail": "/home/test/.bashrc"
+        });
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'status', 'done', ?2)",
+                params!["2026-08-29T15:35:50Z", edit.to_string()],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'status', 'puma', ?2)",
+                params!["2026-08-29T15:35:51Z", edit.to_string()],
+            )
+            .unwrap();
+        let current_event = db.conn.last_insert_rowid();
+
+        assert_eq!(
+            durable_session_identity(&db, "done").as_deref(),
+            Some(native_id)
+        );
+        assert_eq!(
+            durable_session_identity(&db, "puma").as_deref(),
+            Some(native_id)
+        );
+        assert_eq!(
+            find_collision_partner(&db, current_event, "puma", "/home/test/.bashrc"),
+            None
+        );
+        cleanup_test_db(db_path);
     }
 
     #[test]

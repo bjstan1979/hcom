@@ -1356,13 +1356,12 @@ fn maybe_emit_launch_blocked(
     config: &ToolConfig,
     outcome: &mut LaunchOutcome,
 ) {
-    // Plugin-driven tools bind their extension slightly after the TUI settles;
-    // give that bind a generous grace so a slow-but-valid launch is not
-    // transient-blocked (drive_launch_outcome would recover it to Ready, but the
-    // spurious blocked event is noisy). A genuinely dead extension still blocks
-    // once the grace elapses with no kind='plugin' endpoint.
+    // Plugin-driven tools bind after Pi/OMP finishes loading its configured
+    // extensions and packages. A cold persistent-workspace seed can legitimately
+    // take tens of seconds after the first TUI frame, so avoid a false blocked
+    // lifecycle event while retaining a finite dead-plugin diagnosis window.
     const SETTLE_THRESHOLD: Duration = Duration::from_millis(1500);
-    const PLUGIN_BIND_GRACE: Duration = Duration::from_secs(10);
+    const PLUGIN_BIND_GRACE: Duration = Duration::from_secs(60);
     let settle_threshold = if config.launch_ready_on_plugin_bind {
         PLUGIN_BIND_GRACE
     } else {
@@ -1639,9 +1638,9 @@ pub fn run_delivery_loop(
     // push the initial label, subsequent iterations only push on change.
     let mut host_label = host_label::HostLabel::resolve();
 
-    // OpenCode: plugin handles delivery after session exists. The delivery thread
-    // only injects the FIRST message via PTY to bootstrap the session in the TUI.
-    // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
+    // Plugin-managed tools use PTY only for a first-message bootstrap when no
+    // session exists. Once the extension binds, acceptance-aware plugin delivery
+    // owns inbox draining and durable ACK.
     use crate::tool::Tool;
     use std::str::FromStr;
     if matches!(
@@ -1650,9 +1649,9 @@ pub fn run_delivery_loop(
     ) {
         log_info(
             "native",
-            "delivery.opencode_mode",
+            "delivery.plugin_mode",
             &format!(
-                "OpenCode mode for {}: first-message PTY bootstrap, then plugin handles delivery",
+                "Plugin-managed delivery mode for {}: first-message PTY bootstrap, then extension handles delivery",
                 current_name
             ),
         );
@@ -1688,14 +1687,14 @@ pub fn run_delivery_loop(
                 break;
             }
 
-            // First-message bootstrap: inject via PTY to create session in TUI.
-            // Only fires once — after this, the plugin handles all delivery.
-            // Skip if plugin already has a session (e.g. user typed first, or session resumed).
+            // First-message bootstrap: inject via PTY to create a session in the TUI.
+            // Only fires once; after that the bound extension owns delivery. Skip
+            // when a user turn/resume already established the session.
             if !first_message_injected && db.has_session(&current_name) {
                 first_message_injected = true;
                 log_info(
                     "native",
-                    "delivery.opencode_skip_inject",
+                    "delivery.plugin_skip_inject",
                     &format!(
                         "{}: session already exists, plugin handles delivery",
                         current_name
@@ -1707,8 +1706,8 @@ pub fn run_delivery_loop(
                 let input_box_width = (cols as usize).saturating_sub(15).max(10);
                 let text = build_wake_inject_text(db, &current_name, input_box_width);
                 if inject_text(state.inject_port, &text) {
-                    // OpenCode has no prompt-text parser here, so give the TUI
-                    // enough time to render the injected bootstrap before Enter.
+                    // Plugin-managed tools have no PTY prompt-text parser here, so
+                    // give the TUI time to render the bootstrap before Enter.
                     std::thread::sleep(Duration::from_millis(800));
                     if inject_enter(state.inject_port) {
                         first_message_injected = true;
@@ -3084,6 +3083,26 @@ mod tests {
             &ToolConfig::cursor(),
             &state
         ));
+    }
+    #[test]
+    fn pi_launch_ready_uses_plugin_bind_when_commands_header_scrolled_offscreen() {
+        let (_dir, db) = open_ready_test_db();
+        let config = ToolConfig::for_tool(crate::tool::Tool::Pi);
+        assert!(config.launch_ready_on_plugin_bind);
+
+        let mut screen = safe_screen();
+        screen.ready = false; // `/ commands` scrolled above a short/fullscreen viewport.
+        screen.prompt_empty = false; // Pi delivery is extension-owned, not PTY-gated.
+        let state = make_state(screen, 500);
+        assert!(!launch_ready_observed(&db, "ravi", &config, &state));
+
+        db.upsert_notify_endpoint("ravi", "pty", 4001).unwrap();
+        assert!(!launch_ready_observed(&db, "ravi", &config, &state));
+
+        // Broker-mode Pi has no host-reachable TCP listener; port 0 is a marker
+        // created only by an authenticated pi-start bind.
+        db.upsert_notify_endpoint("ravi", "plugin", 0).unwrap();
+        assert!(launch_ready_observed(&db, "ravi", &config, &state));
     }
 
     #[test]

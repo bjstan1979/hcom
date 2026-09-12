@@ -897,8 +897,11 @@ pub static PI: IntegrationSpec = IntegrationSpec {
         require_prompt_empty: false,
         block_on_user_activity: false,
         block_on_approval: true,
+        // Pi's startup resource inventory can scroll `/ commands` off a short or
+        // fullscreen terminal. The authenticated pi-start bind is the rendering-
+        // independent readiness proof; broker-mode plugins register a port-0 marker.
         launch_requires_ready: true,
-        launch_ready_on_plugin_bind: false,
+        launch_ready_on_plugin_bind: true,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_PI_ARGS"),

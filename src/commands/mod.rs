@@ -3,6 +3,7 @@
 
 // Messaging
 pub mod listen;
+pub mod message;
 pub mod send;
 
 // Lifecycle

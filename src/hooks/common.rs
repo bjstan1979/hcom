@@ -52,6 +52,7 @@ pub(crate) fn dispatch_with_panic_guard<R>(
 /// admin-level and require explicit user approval.
 pub(crate) const SAFE_HCOM_COMMANDS: &[&str] = &[
     "send",
+    "message",
     "start",
     "help",
     "--help",
@@ -123,6 +124,25 @@ pub(crate) fn message_to_value(m: &Message) -> Value {
     }
     if let Some(ref bundle_id) = m.bundle_id {
         obj.insert("bundle_id".into(), Value::String(bundle_id.clone()));
+    }
+    for (key, value) in [
+        ("message_id", m.message_id.as_ref()),
+        ("correlation_id", m.correlation_id.as_ref()),
+        ("in_reply_to", m.in_reply_to.as_ref()),
+        ("reply_endpoint", m.reply_endpoint.as_ref()),
+        ("delivery_endpoint", m.delivery_endpoint.as_ref()),
+        ("supersedes", m.supersedes.as_ref()),
+        ("retry_of", m.retry_of.as_ref()),
+    ] {
+        if let Some(value) = value {
+            obj.insert(key.into(), Value::String(value.clone()));
+        }
+    }
+    if m.expects_reply {
+        obj.insert("expects_reply".into(), Value::Bool(true));
+    }
+    if !m.attachments.is_empty() {
+        obj.insert("attachments".into(), serde_json::json!(m.attachments));
     }
     Value::Object(obj)
 }

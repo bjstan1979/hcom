@@ -138,6 +138,54 @@ fn title_write_safe(pending_utf8: u8, pending_escape: PendingEscape) -> bool {
     pending_utf8 == 0 && pending_escape == PendingEscape::None
 }
 
+/// Re-emit the first HCOM title while a terminal is still creating its tab.
+///
+/// Windows Terminal can apply the profile title *after* the child has already
+/// written its first OSC 1/2 when `windowingBehavior=useAnyExisting`. A few
+/// bounded retries keep that terminal-owned initialization from winning while
+/// preserving the normal change-only behavior once startup has settled.
+#[cfg(unix)]
+const TITLE_STARTUP_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+];
+
+#[derive(Default)]
+#[cfg(unix)]
+struct StartupTitleRetry {
+    initial_write: Option<Instant>,
+    next_retry: usize,
+}
+
+#[cfg(unix)]
+impl StartupTitleRetry {
+    fn retry_due(&self, now: Instant) -> bool {
+        self.initial_write.is_some_and(|initial_write| {
+            self.next_retry < TITLE_STARTUP_RETRY_DELAYS.len()
+                && now.saturating_duration_since(initial_write)
+                    >= TITLE_STARTUP_RETRY_DELAYS[self.next_retry]
+        })
+    }
+
+    /// Cap the proxy poll so a quiet child cannot delay a scheduled retry by
+    /// the normal ten-second idle timeout.
+    fn poll_timeout_ms(&self, now: Instant) -> Option<u16> {
+        let initial_write = self.initial_write?;
+        let delay = *TITLE_STARTUP_RETRY_DELAYS.get(self.next_retry)?;
+        let remaining = (initial_write + delay).saturating_duration_since(now);
+        Some(remaining.as_millis().clamp(1, u16::MAX as u128) as u16)
+    }
+
+    fn record_write(&mut self, now: Instant, retry_due: bool) {
+        if self.initial_write.is_none() {
+            self.initial_write = Some(now);
+        } else if retry_due && self.next_retry < TITLE_STARTUP_RETRY_DELAYS.len() {
+            self.next_retry += 1;
+        }
+    }
+}
+
 /// Detect the submit edge from input text snapshots.
 ///
 /// The prompt can briefly become undetectable while a TUI redraws, so treat
@@ -795,6 +843,7 @@ impl Proxy {
             .unwrap_or(crate::shared::TitleMode::Combined);
         let title_enabled = title_mode != crate::shared::TitleMode::Off;
         let mut last_written_child = String::new();
+        let mut startup_title_retry = StartupTitleRetry::default();
 
         // Track incomplete UTF-8 sequences to defer title writes.
         // When PTY output ends with partial multi-byte character, writing our title OSC
@@ -905,6 +954,14 @@ impl Proxy {
             // full 10s for the listener to re-enter the poll set on the next iteration.
             if !include_listener {
                 poll_timeout = poll_timeout.min(100u16);
+            }
+            if stdout_is_tty
+                && title_enabled
+                && title_write_safe(pending_utf8, pending_escape)
+                && let Some(title_retry_timeout) =
+                    startup_title_retry.poll_timeout_ms(Instant::now())
+            {
+                poll_timeout = poll_timeout.min(title_retry_timeout);
             }
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
@@ -1309,10 +1366,13 @@ impl Proxy {
                 } else {
                     ""
                 };
+                let now = Instant::now();
+                let retry_due = startup_title_retry.retry_due(now);
                 if !name.is_empty()
                     && (name != last_written_name
                         || status != last_written_status
-                        || child != last_written_child)
+                        || child != last_written_child
+                        || retry_due)
                 {
                     let child_opt = (!child.is_empty()).then_some(child);
                     let escape = shared::build_title_escape(
@@ -1323,6 +1383,7 @@ impl Proxy {
                         child_opt,
                     );
                     write_all(&stdout_fd, escape.as_bytes())?;
+                    startup_title_retry.record_write(now, retry_due);
                     last_written_child.clear();
                     last_written_child.push_str(child);
                     last_written_name = name;
@@ -1625,12 +1686,14 @@ where
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        PtyTarget, initialize_delivery_components, prompt_submit_observed, strip_focus_events,
+        PtyTarget, StartupTitleRetry, TITLE_STARTUP_RETRY_DELAYS, initialize_delivery_components,
+        prompt_submit_observed, strip_focus_events,
     };
     use anyhow::anyhow;
     use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn adhoc_pty_target_stays_adhoc_for_delivery() {
@@ -1938,6 +2001,46 @@ mod tests {
     #[test]
     fn test_title_write_blocked_by_multiple_conditions() {
         assert!(!title_write_safe(2, PendingEscape::Csi));
+    }
+
+    #[test]
+    fn startup_title_retry_runs_on_bounded_schedule() {
+        let start = Instant::now();
+        let mut retry = StartupTitleRetry::default();
+
+        assert!(!retry.retry_due(start));
+        assert_eq!(retry.poll_timeout_ms(start), None);
+
+        retry.record_write(start, false);
+        assert_eq!(retry.poll_timeout_ms(start), Some(250));
+        assert!(!retry.retry_due(start + Duration::from_millis(249)));
+
+        let first_retry = start + TITLE_STARTUP_RETRY_DELAYS[0];
+        assert!(retry.retry_due(first_retry));
+        retry.record_write(first_retry, true);
+        assert_eq!(retry.poll_timeout_ms(first_retry), Some(750));
+
+        let second_retry = start + TITLE_STARTUP_RETRY_DELAYS[1];
+        assert!(retry.retry_due(second_retry));
+        retry.record_write(second_retry, true);
+
+        let third_retry = start + TITLE_STARTUP_RETRY_DELAYS[2];
+        assert!(retry.retry_due(third_retry));
+        retry.record_write(third_retry, true);
+
+        assert!(!retry.retry_due(third_retry + Duration::from_secs(30)));
+        assert_eq!(retry.poll_timeout_ms(third_retry), None);
+    }
+
+    #[test]
+    fn title_changes_do_not_consume_startup_retries_early() {
+        let start = Instant::now();
+        let mut retry = StartupTitleRetry::default();
+
+        retry.record_write(start, false);
+        retry.record_write(start + Duration::from_millis(100), false);
+
+        assert!(retry.retry_due(start + TITLE_STARTUP_RETRY_DELAYS[0]));
     }
 
     // ---- has_pending_escape tests ----

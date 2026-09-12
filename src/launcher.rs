@@ -388,6 +388,7 @@ where
         "HCOM_WORKER_SANDBOX_ROOT",
         "HCOM_PODMAN_IMAGE",
         "HCOM_PODMAN_STATE_ROOT",
+        "HCOM_PODMAN_PAYLOAD_ROOT",
         "HCOM_PODMAN_PIDS_LIMIT",
         "HCOM_PODMAN_MEMORY",
         "HCOM_PODMAN_CPUS",
@@ -3087,11 +3088,13 @@ mod tests {
         let _guard = EnvVarGuard::remove(vec![
             "HCOM_WORKER_SANDBOX".to_string(),
             "HCOM_WORKER_SANDBOX_ROOT".to_string(),
+            "HCOM_PODMAN_PAYLOAD_ROOT".to_string(),
             "HCOM_BROKER_SOCKET".to_string(),
             "HCOM_BROKER_TOKEN_FILE".to_string(),
         ]);
         unsafe { std::env::set_var("HCOM_WORKER_SANDBOX", "podman-workspace") };
         unsafe { std::env::set_var("HCOM_WORKER_SANDBOX_ROOT", "/repo") };
+        unsafe { std::env::set_var("HCOM_PODMAN_PAYLOAD_ROOT", "/payloads") };
         unsafe { std::env::set_var("HCOM_BROKER_SOCKET", "/run/hcom.sock") };
         unsafe { std::env::set_var("HCOM_BROKER_TOKEN_FILE", "/run/hcom.token") };
 
@@ -3108,6 +3111,10 @@ mod tests {
         assert_eq!(
             env.get("HCOM_WORKER_SANDBOX_ROOT").map(String::as_str),
             Some("/repo")
+        );
+        assert_eq!(
+            env.get("HCOM_PODMAN_PAYLOAD_ROOT").map(String::as_str),
+            Some("/payloads")
         );
         assert_eq!(
             env.get("HCOM_BROKER_SOCKET").map(String::as_str),

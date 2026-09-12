@@ -6,9 +6,13 @@
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
-use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
 const MODE_ENV: &str = "HCOM_WORKER_SANDBOX";
@@ -17,6 +21,9 @@ const WORKSPACE_MODE: &str = "workspace";
 const PODMAN_WORKSPACE_MODE: &str = "podman-workspace";
 const PODMAN_IMAGE_ENV: &str = "HCOM_PODMAN_IMAGE";
 const PODMAN_STATE_ROOT_ENV: &str = "HCOM_PODMAN_STATE_ROOT";
+const PODMAN_PAYLOAD_ROOT_ENV: &str = "HCOM_PODMAN_PAYLOAD_ROOT";
+const PODMAN_PAYLOAD_CONTAINER_ROOT: &str = "/opt/pi-payload";
+const PODMAN_PAYLOAD_MODE: &str = "readonly-host-bind";
 const PODMAN_PIDS_LIMIT_ENV: &str = "HCOM_PODMAN_PIDS_LIMIT";
 const PODMAN_MEMORY_ENV: &str = "HCOM_PODMAN_MEMORY";
 const PODMAN_CPUS_ENV: &str = "HCOM_PODMAN_CPUS";
@@ -147,6 +154,81 @@ fn env_nonempty(name: &str) -> Option<String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
 }
+fn resolve_podman_payload(pinned: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
+    let explicit = env_nonempty(PODMAN_PAYLOAD_ROOT_ENV);
+    let root = match explicit.as_ref() {
+        Some(root) => PathBuf::from(root),
+        None => dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Cannot resolve HOME for Podman payload"))?
+            .join(".local/share/hcom-sandbox/payloads"),
+    };
+    let current = pinned
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.join("current"));
+    let current_metadata = fs::symlink_metadata(&current)
+        .with_context(|| format!("Podman payload is not initialized: {}", current.display()))?;
+    if pinned.is_none() && !current_metadata.file_type().is_symlink() {
+        bail!(
+            "Current Podman payload must be a symlink: {}",
+            current.display()
+        );
+    }
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("Cannot resolve Podman payload root {}", root.display()))?;
+    let current = current.canonicalize().with_context(|| {
+        format!(
+            "Cannot resolve current Podman payload under {}",
+            root.display()
+        )
+    })?;
+    let versions = root.join("versions");
+    if current.parent() != Some(versions.as_path()) || !current.is_dir() {
+        bail!(
+            "Current Podman payload escapes the version root: {}",
+            current.display()
+        );
+    }
+    let metadata = fs::metadata(&current)?;
+    if metadata.permissions().mode() & 0o222 != 0 {
+        bail!(
+            "Current Podman payload must be immutable: {}",
+            current.display()
+        );
+    }
+    for name in [".payload-id", ".manifest-sha256", "MANIFEST.txt"] {
+        let path = current.join(name);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("Podman payload marker missing: {}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            bail!(
+                "Podman payload marker is not a regular file: {}",
+                path.display()
+            );
+        }
+    }
+    let payload_id = current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Podman payload has an invalid version directory"))?;
+    let marker_id = fs::read_to_string(current.join(".payload-id"))?;
+    if marker_id.trim() != payload_id {
+        bail!("Podman payload ID marker mismatch: {}", current.display());
+    }
+    let manifest = fs::read(current.join("MANIFEST.txt"))?;
+    let manifest_sha = Sha256::digest(&manifest)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let marker_sha = fs::read_to_string(current.join(".manifest-sha256"))?;
+    if marker_sha.trim() != manifest_sha {
+        bail!(
+            "Podman payload Manifest marker mismatch: {}",
+            current.display()
+        );
+    }
+    Ok((root, current))
+}
 
 fn workspace_id(workspace: &Path) -> String {
     let digest = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
@@ -209,6 +291,7 @@ fn build_podman_workspace_command(
         bail!("Podman is not running rootless; refusing podman-workspace sandbox");
     }
 
+    let mut payload = None;
     let id = workspace_id(workspace);
     let container = format!("hcs-{id}");
     let state_root = match env_nonempty(PODMAN_STATE_ROOT_ENV) {
@@ -220,11 +303,23 @@ fn build_podman_workspace_command(
     };
     let pi_state = state_root.join("pi-agent");
     let cache_state = state_root.join("cache");
+    let config_state = pi_state.join(".config");
+    let data_state = pi_state.join(".local/share");
+    let xdg_state = pi_state.join(".local/state");
     let client_state = state_root.join("hcom-client");
-    for path in [&state_root, &pi_state, &cache_state, &client_state] {
+    let runtime_bin = pi_state.join("bin");
+    let runtime_hcom = runtime_bin.join("hcom");
+    for path in [
+        &state_root,
+        &pi_state,
+        &cache_state,
+        &config_state,
+        &data_state,
+        &xdg_state,
+        &client_state,
+    ] {
         ensure_private_dir(path)?;
     }
-    seed_workspace_pi_credentials(&pi_state)?;
     let lock_path = state_root.join("create.lock");
     let lock = OpenOptions::new()
         .create(true)
@@ -234,6 +329,9 @@ fn build_podman_workspace_command(
         .context("Failed to open Podman workspace lock")?;
     crate::sys::fs::set_private(&lock_path)?;
     lock_file(&lock)?;
+    stage_workspace_hcom_binary(&pi_state)?;
+    seed_workspace_pi_credentials(&pi_state)?;
+    sync_workspace_append_system(&pi_state)?;
 
     let exists_args = vec!["container".into(), "exists".into(), container.clone()];
     let exists = podman_output(&podman, &exists_args)?;
@@ -252,10 +350,33 @@ fn build_podman_workspace_command(
             if label_id != id || label_path != workspace.to_string_lossy() {
                 bail!("Existing container {container} does not match workspace identity");
             }
+            let payload_label = inspect_value(
+                &podman,
+                &container,
+                "{{ index .Config.Labels \"io.hcom.payload-root\" }}",
+            )?;
+            if !payload_label.is_empty() && payload_label != "<no value>" {
+                payload = Some(resolve_podman_payload(Some(Path::new(&payload_label)))?);
+            }
         }
         Some(1) => {
+            payload = Some(resolve_podman_payload(None)?);
             let image =
                 env_nonempty(PODMAN_IMAGE_ENV).unwrap_or_else(|| DEFAULT_PODMAN_IMAGE.to_string());
+            let image_inspect_args = vec![
+                "image".into(),
+                "inspect".into(),
+                "--format".into(),
+                "{{ index .Config.Labels \"io.hcom.payload-mode\" }}".into(),
+                image.clone(),
+            ];
+            let image_payload_mode =
+                podman_success(&podman, &image_inspect_args, "workspace image inspection")?;
+            if String::from_utf8_lossy(&image_payload_mode.stdout).trim() != PODMAN_PAYLOAD_MODE {
+                bail!(
+                    "Podman workspace image {image} does not declare io.hcom.payload-mode={PODMAN_PAYLOAD_MODE}"
+                );
+            }
             let mut create = vec![
                 "create".into(),
                 "--name".into(),
@@ -282,8 +403,21 @@ fn build_podman_workspace_command(
                 "--cpus".into(),
                 env_nonempty(PODMAN_CPUS_ENV).unwrap_or_else(|| "2".into()),
             ];
+            if let Some((_, payload)) = payload.as_ref() {
+                create.extend([
+                    "--label".into(),
+                    format!("io.hcom.payload-root={}", payload.to_string_lossy()),
+                    "--volume".into(),
+                    bind_mount_arg(payload, Path::new(PODMAN_PAYLOAD_CONTAINER_ROOT), true),
+                ]);
+            }
             for target in ["/tmp", "/run", "/var/tmp"] {
-                create.extend(["--tmpfs".into(), format!("{target}:rw,nosuid,nodev")]);
+                // The workspace is mounted at its canonical host path below.
+                // Podman rejects two mounts with the same destination, so an
+                // exact temporary-directory workspace must replace that tmpfs.
+                if workspace != Path::new(target) {
+                    create.extend(["--tmpfs".into(), format!("{target}:rw,nosuid,nodev")]);
+                }
             }
             for mount in [
                 bind_mount_arg(workspace, workspace, false),
@@ -362,12 +496,16 @@ fn build_podman_workspace_command(
     }
     drop(lock);
 
+    let is_pi = Path::new(&worker_command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("pi");
     let container_command = match Path::new(&worker_command)
         .file_name()
         .and_then(|name| name.to_str())
     {
         Some("pi") => "/usr/local/bin/pi-container-entry".to_string(),
-        Some("hcom") => "/usr/local/bin/hcom".to_string(),
+        Some("hcom") => runtime_hcom.to_string_lossy().into_owned(),
         _ => worker_command,
     };
     let mut args = vec!["exec".into(), "--interactive".into()];
@@ -379,6 +517,20 @@ fn build_podman_workspace_command(
         workspace.to_string_lossy().into_owned(),
         "--env".into(),
         "HOME=/home/pi".into(),
+        "--env".into(),
+        format!(
+            "PATH={}:{}",
+            runtime_bin.to_string_lossy(),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ),
+        "--env".into(),
+        format!("XDG_CONFIG_HOME={}", config_state.to_string_lossy()),
+        "--env".into(),
+        format!("XDG_CACHE_HOME={}", cache_state.to_string_lossy()),
+        "--env".into(),
+        format!("XDG_DATA_HOME={}", data_state.to_string_lossy()),
+        "--env".into(),
+        format!("XDG_STATE_HOME={}", xdg_state.to_string_lossy()),
         "--env".into(),
         format!("PI_CODING_AGENT_DIR={}", pi_state.to_string_lossy()),
         "--env".into(),
@@ -393,12 +545,26 @@ fn build_podman_workspace_command(
         "--env".into(),
         format!("{ROOT_ENV}={}", workspace.to_string_lossy()),
     ]);
+    if payload.is_some() {
+        args.extend([
+            "--env".into(),
+            format!("PI_FRAMEWORK_PAYLOAD={PODMAN_PAYLOAD_CONTAINER_ROOT}"),
+        ]);
+    }
+    if is_pi {
+        // Older persistent images let the entrypoint's package-refresh lock fd
+        // survive `exec pi`, permanently blocking the next Pi in this workspace.
+        // Interpose a shell only for the final exec so existing containers are
+        // repaired without weakening serialization of the refresh itself.
+        args.extend(["--env".into(), "PI_CONTAINER_PI_BIN=/bin/sh".into()]);
+    }
     for name in [
         "HCOM_PROCESS_ID",
         "HCOM_LAUNCHED",
         "HCOM_TAG",
         "HCOM_BROKER_SOCKET",
         "HCOM_BROKER_TOKEN_FILE",
+        "HCOM_BRIDGE_TOKEN_FILE",
         AGENTMEMORY_SOCKET_ENV,
         ANYSEARCH_SOCKET_ENV,
         MMX_SOCKET_ENV,
@@ -407,6 +573,13 @@ fn build_podman_workspace_command(
         args.extend(["--env".into(), name.into()]);
     }
     args.extend([container, container_command]);
+    if is_pi {
+        args.extend([
+            "-c".into(),
+            "exec 9>&-; exec /usr/local/bin/pi \"$@\"".into(),
+            "pi".into(),
+        ]);
+    }
     args.extend(worker_args);
     Ok(WorkerCommand {
         command: podman,
@@ -474,11 +647,41 @@ fn validate_pi_rpc_args(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn seed_workspace_pi_credentials(pi_state: &Path) -> Result<()> {
+fn stage_workspace_hcom_binary(pi_state: &Path) -> Result<()> {
+    let source = std::env::current_exe()
+        .context("Cannot resolve the running HCOM executable")?
+        .canonicalize()
+        .context("Cannot canonicalize the running HCOM executable")?;
+    let mut source_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&source)
+        .with_context(|| format!("Cannot open running HCOM executable {}", source.display()))?;
+    if !source_file.metadata()?.is_file() {
+        bail!("Running HCOM executable is not a regular file");
+    }
+
+    let pi_state_dir = open_verified_directory(pi_state)?;
+    let bin_dir = ensure_private_subdirectory_at(&pi_state_dir, OsStr::new("bin"))?;
+    let destination = pi_state.join("bin/hcom");
+    atomic_executable_copy_at(&mut source_file, &bin_dir, OsStr::new("hcom"), &destination)
+}
+
+fn host_pi_agent_directory() -> Result<PathBuf> {
     let host_pi = std::env::var_os("PI_CODING_AGENT_DIR")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".pi/agent")))
         .ok_or_else(|| anyhow::anyhow!("Cannot resolve host Pi state directory"))?;
+    host_pi.canonicalize().with_context(|| {
+        format!(
+            "Cannot resolve host Pi state directory {}",
+            host_pi.display()
+        )
+    })
+}
+
+fn seed_workspace_pi_credentials(pi_state: &Path) -> Result<()> {
+    let host_pi = host_pi_agent_directory()?;
     for name in ["auth.json", "models.json"] {
         sync_newer_private_file(&host_pi.join(name), &pi_state.join(name))?;
     }
@@ -486,7 +689,9 @@ fn seed_workspace_pi_credentials(pi_state: &Path) -> Result<()> {
     let host_credentials = host_pi.join("credentials");
     if host_credentials.is_dir() {
         let sandbox_credentials = pi_state.join("credentials");
-        ensure_private_dir(&sandbox_credentials)?;
+        let pi_state_dir = open_verified_directory(pi_state)?;
+        let sandbox_credentials_dir =
+            ensure_private_subdirectory_at(&pi_state_dir, OsStr::new("credentials"))?;
         for entry in fs::read_dir(&host_credentials).with_context(|| {
             format!(
                 "Failed to read host Pi credentials {}",
@@ -503,30 +708,375 @@ fn seed_workspace_pi_credentials(pi_state: &Path) -> Result<()> {
             {
                 continue;
             }
-            sync_newer_private_file(&source, &sandbox_credentials.join(entry.file_name()))?;
+            let file_name = entry.file_name();
+            sync_newer_private_file_at(
+                &source,
+                &sandbox_credentials_dir,
+                &file_name,
+                &sandbox_credentials.join(&file_name),
+            )?;
         }
     }
     Ok(())
 }
 
+fn sync_workspace_append_system(pi_state: &Path) -> Result<()> {
+    let host_pi = host_pi_agent_directory()?;
+    sync_managed_private_file(
+        &host_pi.join("APPEND_SYSTEM.md"),
+        &pi_state.join("APPEND_SYSTEM.md"),
+    )
+}
+
 fn sync_newer_private_file(source: &Path, destination: &Path) -> Result<()> {
-    if !source.is_file() {
+    let parent_path = destination
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Credential destination has no parent"))?;
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Credential destination has no file name"))?;
+    let parent = open_verified_directory(parent_path)?;
+    set_private_dir_fd(&parent)?;
+    sync_newer_private_file_at(source, &parent, file_name, destination)
+}
+
+fn sync_newer_private_file_at(
+    source: &Path,
+    parent: &File,
+    file_name: &OsStr,
+    destination: &Path,
+) -> Result<()> {
+    let mut source_file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(source)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Credential source is unavailable or a symlink: {}",
+                    source.display()
+                )
+            });
+        }
+    };
+    let source_meta = source_file.metadata()?;
+    if !source_meta.is_file() {
         return Ok(());
     }
+
     // Workspace credentials are private copies, not mounts. Refresh only when
     // the host copy is newer, so host login/config updates reach an existing
     // persistent sandbox without overwriting newer sandbox-local changes.
-    let host_updated = match (source.metadata()?.modified(), destination.metadata()) {
-        (Ok(source_time), Ok(destination_meta)) => match destination_meta.modified() {
-            Ok(destination_time) => source_time > destination_time,
-            Err(_) => true,
-        },
+    let host_updated = match (
+        source_meta.modified(),
+        open_regular_file_at(parent, file_name)?,
+    ) {
+        (Ok(source_time), Some(destination_file)) => {
+            match destination_file.metadata()?.modified() {
+                Ok(destination_time) => source_time > destination_time,
+                Err(_) => true,
+            }
+        }
         _ => true,
     };
     if host_updated {
-        copy_private_file(source, destination)?;
+        atomic_private_copy_at(&mut source_file, parent, file_name, destination)?;
     }
     Ok(())
+}
+
+fn sync_managed_private_file(source: &Path, destination: &Path) -> Result<()> {
+    let parent_path = destination
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Managed destination has no parent"))?;
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Managed destination has no file name"))?;
+    let parent = open_verified_directory(parent_path)?;
+    set_private_dir_fd(&parent)?;
+    // Validate the existing leaf even when the canonical host file is absent;
+    // fallback may be missing or regular, never a symlink or special file.
+    let mut destination_file = open_regular_file_at(&parent, file_name)?;
+
+    let mut source_file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(source)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Managed source is unavailable or a symlink: {}",
+                    source.display()
+                )
+            });
+        }
+    };
+    if !source_file.metadata()?.is_file() {
+        bail!("Managed source is not a regular file: {}", source.display());
+    }
+
+    let source_digest = file_sha256(&mut source_file)?;
+    let destination_matches = match destination_file.as_mut() {
+        Some(destination_file) => {
+            let matches = file_sha256(destination_file)? == source_digest;
+            destination_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            matches
+        }
+        None => false,
+    };
+    if !destination_matches {
+        atomic_private_copy_at(&mut source_file, &parent, file_name, destination)?;
+    }
+    Ok(())
+}
+
+fn file_sha256(file: &mut File) -> Result<[u8; 32]> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(digest.finalize().into())
+}
+
+fn path_component_cstring(component: &OsStr) -> Result<CString> {
+    CString::new(component.as_bytes()).context("Sandbox path contains a NUL byte")
+}
+
+/// Open every directory component without following symlinks. The returned fd
+/// pins the verified parent even if an attacker concurrently renames its path.
+fn open_verified_directory(path: &Path) -> Result<File> {
+    let mut current = if path.is_absolute() {
+        File::open("/").context("Failed to open filesystem root")?
+    } else {
+        File::open(".").context("Failed to open current directory")?
+    };
+
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir => bail!(
+                "Refusing credential destination parent traversal: {}",
+                path.display()
+            ),
+            Component::Prefix(_) => bail!(
+                "Unsupported credential destination prefix: {}",
+                path.display()
+            ),
+        };
+        let name = path_component_cstring(name)?;
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "Credential destination parent is missing, invalid, or a symlink: {}",
+                    path.display()
+                )
+            });
+        }
+        current = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(current)
+}
+
+fn open_regular_file_at(parent: &File, name: &OsStr) -> Result<Option<File>> {
+    let name = path_component_cstring(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error).context("Credential destination is invalid or a symlink");
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        bail!("Credential destination is not a regular file");
+    }
+    Ok(Some(file))
+}
+
+fn set_private_dir_fd(directory: &File) -> Result<()> {
+    let result = unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) };
+    if result != 0 {
+        return Err(io::Error::last_os_error()).context("Failed to secure credential directory");
+    }
+    Ok(())
+}
+
+fn ensure_private_subdirectory_at(parent: &File, name: &OsStr) -> Result<File> {
+    let name = path_component_cstring(name)?;
+    let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+    if created != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error).context("Failed to create credential directory");
+        }
+    }
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error())
+            .context("Credential destination directory is invalid or a symlink");
+    }
+    let directory = unsafe { File::from_raw_fd(fd) };
+    set_private_dir_fd(&directory)?;
+    Ok(directory)
+}
+
+fn reject_symlink_at(parent: &File, name: &OsStr) -> Result<()> {
+    let name = path_component_cstring(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            bail!("Credential destination is a symlink");
+        }
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error).context("Failed to inspect credential destination")
+    }
+}
+
+fn atomic_private_copy_at(
+    source: &mut File,
+    parent: &File,
+    destination_name: &OsStr,
+    destination: &Path,
+) -> Result<()> {
+    atomic_copy_at(
+        source,
+        parent,
+        destination_name,
+        destination,
+        0o600,
+        "private credential",
+    )
+}
+
+fn atomic_executable_copy_at(
+    source: &mut File,
+    parent: &File,
+    destination_name: &OsStr,
+    destination: &Path,
+) -> Result<()> {
+    atomic_copy_at(
+        source,
+        parent,
+        destination_name,
+        destination,
+        0o755,
+        "workspace HCOM executable",
+    )
+}
+
+fn atomic_copy_at(
+    source: &mut File,
+    parent: &File,
+    destination_name: &OsStr,
+    destination: &Path,
+    mode: u32,
+    label: &str,
+) -> Result<()> {
+    reject_symlink_at(parent, destination_name)?;
+    let temp_name = format!(
+        ".{}.hcom-{}.tmp",
+        destination_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    );
+    let temp_name_c = path_component_cstring(OsStr::new(&temp_name))?;
+    let destination_name_c = path_component_cstring(destination_name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            temp_name_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+            mode,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).with_context(|| {
+            format!(
+                "Failed to create {label} temp for {}",
+                destination.display()
+            )
+        });
+    }
+    let mut temp = unsafe { File::from_raw_fd(fd) };
+
+    let write_result = (|| -> Result<()> {
+        io::copy(source, &mut temp).with_context(|| {
+            format!("Failed to copy {label} bytes to {}", destination.display())
+        })?;
+        temp.set_permissions(fs::Permissions::from_mode(mode))?;
+        temp.sync_all()?;
+        // Recheck immediately before rename. renameat replaces a raced symlink
+        // itself rather than following it, so outside content is never opened.
+        reject_symlink_at(parent, destination_name)?;
+        let renamed = unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                temp_name_c.as_ptr(),
+                parent.as_raw_fd(),
+                destination_name_c.as_ptr(),
+            )
+        };
+        if renamed != 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("Failed to publish {label} {}", destination.display()));
+        }
+        parent.sync_all()?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        unsafe {
+            libc::unlinkat(parent.as_raw_fd(), temp_name_c.as_ptr(), 0);
+        }
+    }
+    write_result
 }
 
 fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -878,6 +1428,10 @@ if [ "${FAKE_PODMAN_ROOTLESS:-true}" != true ] && [ "$1" = info ]; then
   exit 0
 fi
 if [ "$1" = info ]; then printf 'true\n'; exit 0; fi
+if [ "$1" = image ] && [ "$2" = inspect ]; then
+  printf '%s\n' "${FAKE_PODMAN_PAYLOAD_MODE:-readonly-host-bind}"
+  exit 0
+fi
 if [ "$1" = container ] && [ "$2" = exists ]; then
   test -d "$FAKE_PODMAN_STATE/$3"
   exit
@@ -886,6 +1440,7 @@ if [ "$1" = container ] && [ "$2" = inspect ]; then
   format=$4
   name=$5
   case "$format" in
+    *payload-root*) cat "$FAKE_PODMAN_STATE/$name/payload" 2>/dev/null || true ;;
     *workspace-path*) cat "$FAKE_PODMAN_STATE/$name/path" ;;
     *workspace*) cat "$FAKE_PODMAN_STATE/$name/id" ;;
     *Running*) test -f "$FAKE_PODMAN_STATE/$name/running" && printf 'true\n' || printf 'false\n' ;;
@@ -898,6 +1453,7 @@ if [ "$1" = create ]; then
   name=
   id=
   path=
+  payload=
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --name) name=$2; shift 2 ;;
@@ -905,6 +1461,7 @@ if [ "$1" = create ]; then
         case "$2" in
           io.hcom.workspace=*) id=${2#*=} ;;
           io.hcom.workspace-path=*) path=${2#*=} ;;
+          io.hcom.payload-root=*) payload=${2#*=} ;;
         esac
         shift 2 ;;
       *) shift ;;
@@ -913,6 +1470,7 @@ if [ "$1" = create ]; then
   mkdir -p "$FAKE_PODMAN_STATE/$name"
   printf '%s\n' "$id" > "$FAKE_PODMAN_STATE/$name/id"
   printf '%s\n' "$path" > "$FAKE_PODMAN_STATE/$name/path"
+  printf '%s\n' "$payload" > "$FAKE_PODMAN_STATE/$name/payload"
   exit 0
 fi
 if [ "$1" = start ]; then touch "$FAKE_PODMAN_STATE/$2/running"; exit 0; fi
@@ -924,6 +1482,272 @@ exit 45
         permissions.set_mode(0o755);
         fs::set_permissions(&script, permissions).unwrap();
         bin
+    }
+
+    #[test]
+    fn credential_refresh_rejects_symlink_destination_and_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.json");
+        fs::write(&source, "new-secret").unwrap();
+
+        let outside_file = temp.path().join("outside.json");
+        fs::write(&outside_file, "outside-sentinel").unwrap();
+        let mut outside_mode = fs::metadata(&outside_file).unwrap().permissions();
+        outside_mode.set_mode(0o640);
+        fs::set_permissions(&outside_file, outside_mode).unwrap();
+
+        let destination_root = temp.path().join("destination");
+        fs::create_dir_all(&destination_root).unwrap();
+        let destination = destination_root.join("auth.json");
+        std::os::unix::fs::symlink(&outside_file, &destination).unwrap();
+        assert!(sync_newer_private_file(&source, &destination).is_err());
+        assert_eq!(
+            fs::read_to_string(&outside_file).unwrap(),
+            "outside-sentinel"
+        );
+        assert_eq!(
+            fs::metadata(&outside_file).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
+        fs::remove_file(&destination).unwrap();
+        let outside_dir = temp.path().join("outside-dir");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let parent_sentinel = outside_dir.join("models.json");
+        fs::write(&parent_sentinel, "parent-sentinel").unwrap();
+        let mut parent_mode = fs::metadata(&parent_sentinel).unwrap().permissions();
+        parent_mode.set_mode(0o604);
+        fs::set_permissions(&parent_sentinel, parent_mode).unwrap();
+        let linked_parent = destination_root.join("credentials");
+        std::os::unix::fs::symlink(&outside_dir, &linked_parent).unwrap();
+
+        assert!(sync_newer_private_file(&source, &linked_parent.join("models.json")).is_err());
+        assert_eq!(
+            fs::read_to_string(&parent_sentinel).unwrap(),
+            "parent-sentinel"
+        );
+        assert_eq!(
+            fs::metadata(&parent_sentinel).unwrap().permissions().mode() & 0o777,
+            0o604
+        );
+
+        fs::remove_file(&linked_parent).unwrap();
+        let source_link = temp.path().join("source-link.json");
+        std::os::unix::fs::symlink(&outside_file, &source_link).unwrap();
+        let regular_destination = destination_root.join("models.json");
+        fs::write(&regular_destination, "destination-sentinel").unwrap();
+        assert!(sync_newer_private_file(&source_link, &regular_destination).is_err());
+        assert_eq!(
+            fs::read_to_string(&regular_destination).unwrap(),
+            "destination-sentinel"
+        );
+    }
+
+    #[test]
+    fn managed_append_system_refresh_is_canonical_atomic_private_and_fallback_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host/APPEND_SYSTEM.md");
+        let runtime = temp.path().join("runtime");
+        let destination = runtime.join("APPEND_SYSTEM.md");
+        fs::create_dir_all(host.parent().unwrap()).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+
+        // A missing host canonical file preserves a regular image/workspace fallback.
+        fs::write(&destination, "image-fallback\n").unwrap();
+        sync_managed_private_file(&host, &destination).unwrap();
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "image-fallback\n"
+        );
+
+        // Canonical content wins even when the workspace copy was modified later.
+        fs::write(&host, "host-canonical-v1\n").unwrap();
+        fs::write(&destination, "newer-workspace-override\n").unwrap();
+        sync_managed_private_file(&host, &destination).unwrap();
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "host-canonical-v1\n"
+        );
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Byte-identical refreshes are no-ops, apart from enforcing private mode.
+        let before = fs::metadata(&destination).unwrap().modified().unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o644)).unwrap();
+        sync_managed_private_file(&host, &destination).unwrap();
+        assert_eq!(
+            fs::metadata(&destination).unwrap().modified().unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Source and destination symlinks fail closed without touching targets.
+        let outside = temp.path().join("outside");
+        fs::write(&outside, "outside-sentinel\n").unwrap();
+        fs::remove_file(&destination).unwrap();
+        std::os::unix::fs::symlink(&outside, &destination).unwrap();
+        assert!(sync_managed_private_file(&host, &destination).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside-sentinel\n");
+
+        fs::remove_file(&destination).unwrap();
+        fs::write(&destination, "destination-sentinel\n").unwrap();
+        let linked_source = temp.path().join("linked-APPEND_SYSTEM.md");
+        std::os::unix::fs::symlink(&outside, &linked_source).unwrap();
+        assert!(sync_managed_private_file(&linked_source, &destination).is_err());
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "destination-sentinel\n"
+        );
+
+        let leftovers: Vec<_> = fs::read_dir(&runtime)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".hcom-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files leaked: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_hcom_stage_rejects_symlinked_bin_and_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let pi_state = temp.path().join("pi-agent");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&pi_state).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        std::os::unix::fs::symlink(&outside, pi_state.join("bin")).unwrap();
+        assert!(stage_workspace_hcom_binary(&pi_state).is_err());
+        assert!(!outside.join("hcom").exists());
+
+        fs::remove_file(pi_state.join("bin")).unwrap();
+        fs::create_dir(pi_state.join("bin")).unwrap();
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, "outside-sentinel").unwrap();
+        std::os::unix::fs::symlink(&sentinel, pi_state.join("bin/hcom")).unwrap();
+        assert!(stage_workspace_hcom_binary(&pi_state).is_err());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "outside-sentinel");
+    }
+
+    #[test]
+    fn concurrent_newer_credential_refresh_is_atomic_and_private() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let destination_dir = temp.path().join("pi-agent");
+        let destination = destination_dir.join("auth.json");
+        fs::create_dir_all(&destination_dir).unwrap();
+        fs::write(&destination, "old-workspace-secret").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&source, vec![b'n'; 256 * 1024]).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let source = source.clone();
+            let destination = destination.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                sync_newer_private_file(&source, &destination)
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+
+        assert_eq!(fs::read(&destination).unwrap(), vec![b'n'; 256 * 1024]);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let leftovers: Vec<_> = fs::read_dir(&destination_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".hcom-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files leaked: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn podman_payload_validation_rejects_mutable_forged_and_escaping_versions() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("payloads");
+        let payload = root.join("versions/test");
+        fs::create_dir_all(&payload).unwrap();
+        let manifest = b"bundle_version=0.0.0\n";
+        let manifest_sha = Sha256::digest(manifest)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        fs::write(payload.join(".payload-id"), "test\n").unwrap();
+        fs::write(
+            payload.join(".manifest-sha256"),
+            format!("{manifest_sha}\n"),
+        )
+        .unwrap();
+        fs::write(payload.join("MANIFEST.txt"), manifest).unwrap();
+        std::os::unix::fs::symlink("versions/test", root.join("current")).unwrap();
+        let _vars = VarGuard::set(&[(PODMAN_PAYLOAD_ROOT_ENV, Some(root.as_os_str()))]);
+
+        assert!(
+            resolve_podman_payload(None)
+                .unwrap_err()
+                .to_string()
+                .contains("must be immutable")
+        );
+        fs::set_permissions(&payload, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::write(payload.join(".payload-id"), "forged\n").unwrap();
+        assert!(
+            resolve_podman_payload(None)
+                .unwrap_err()
+                .to_string()
+                .contains("ID marker mismatch")
+        );
+        fs::write(payload.join(".payload-id"), "test\n").unwrap();
+        fs::write(payload.join(".manifest-sha256"), "forged\n").unwrap();
+        assert!(
+            resolve_podman_payload(None)
+                .unwrap_err()
+                .to_string()
+                .contains("Manifest marker mismatch")
+        );
+        fs::write(
+            payload.join(".manifest-sha256"),
+            format!("{manifest_sha}\n"),
+        )
+        .unwrap();
+        assert_eq!(resolve_podman_payload(None).unwrap().1, payload);
+
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join(".payload-id"), "outside\n").unwrap();
+        fs::write(
+            outside.join(".manifest-sha256"),
+            format!("{manifest_sha}\n"),
+        )
+        .unwrap();
+        fs::write(outside.join("MANIFEST.txt"), manifest).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::remove_file(root.join("current")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("current")).unwrap();
+        assert!(
+            resolve_podman_payload(None)
+                .unwrap_err()
+                .to_string()
+                .contains("escapes the version root")
+        );
     }
 
     #[test]
@@ -943,6 +1767,8 @@ exit 45
         let mmx_socket = mmx_bridge.join("mmx.sock");
         let flowus_bridge = temp.path().join("flowus-bridge");
         let flowus_socket = flowus_bridge.join("flowus.sock");
+        let payload_root = temp.path().join("payloads");
+        let payload = payload_root.join("versions/0.2.29-test");
         for path in [
             &home,
             &hcom,
@@ -959,8 +1785,24 @@ exit 45
         fs::write(&broker_token, "token").unwrap();
         fs::write(&mmx_socket, "socket placeholder").unwrap();
         fs::write(&flowus_socket, "socket placeholder").unwrap();
+        fs::create_dir_all(&payload).unwrap();
+        let manifest = b"test\n";
+        let manifest_sha = Sha256::digest(manifest)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        fs::write(payload.join(".payload-id"), "0.2.29-test\n").unwrap();
+        fs::write(
+            payload.join(".manifest-sha256"),
+            format!("{manifest_sha}\n"),
+        )
+        .unwrap();
+        fs::write(payload.join("MANIFEST.txt"), manifest).unwrap();
+        fs::set_permissions(&payload, fs::Permissions::from_mode(0o555)).unwrap();
+        std::os::unix::fs::symlink("versions/0.2.29-test", payload_root.join("current")).unwrap();
         fs::write(pi.join("auth.json"), "host-auth").unwrap();
         fs::write(pi.join("models.json"), "host-models").unwrap();
+        fs::write(pi.join("APPEND_SYSTEM.md"), "host-canonical-v1\n").unwrap();
         fs::create_dir_all(pi.join("credentials")).unwrap();
         fs::write(pi.join("credentials/provider.md"), "host-provider-key").unwrap();
         #[cfg(unix)]
@@ -981,21 +1823,66 @@ exit 45
             ("FAKE_PODMAN_LOG", Some(log.as_os_str())),
             ("FAKE_PODMAN_STATE", Some(state.as_os_str())),
             ("FAKE_PODMAN_ROOTLESS", Some(std::ffi::OsStr::new("true"))),
+            (
+                "FAKE_PODMAN_PAYLOAD_MODE",
+                Some(std::ffi::OsStr::new(PODMAN_PAYLOAD_MODE)),
+            ),
             ("HCOM_BROKER_SOCKET", Some(broker_socket.as_os_str())),
             ("HCOM_BROKER_TOKEN_FILE", Some(broker_token.as_os_str())),
             (MMX_SOCKET_ENV, Some(mmx_socket.as_os_str())),
             (FLOWUS_SOCKET_ENV, Some(flowus_socket.as_os_str())),
+            (PODMAN_PAYLOAD_ROOT_ENV, Some(payload_root.as_os_str())),
         ];
         let _vars = VarGuard::set(&vars);
+        let id_a = workspace_id(&workspace_a.canonicalize().unwrap());
+        let root = home
+            .join(".local/share/hcom-sandbox/workspaces")
+            .join(&id_a);
+        let append_system = root.join("pi-agent/APPEND_SYSTEM.md");
 
         let first =
             wrap_worker_command("pi".into(), vec!["--model".into(), "x".into()], Some("one"))
                 .unwrap();
+        assert_eq!(
+            fs::read_to_string(&append_system).unwrap(),
+            "host-canonical-v1\n"
+        );
+        let next_payload = payload_root.join("versions/0.2.29-next");
+        fs::create_dir_all(&next_payload).unwrap();
+        fs::write(next_payload.join(".payload-id"), "0.2.29-next\n").unwrap();
+        fs::write(
+            next_payload.join(".manifest-sha256"),
+            format!("{manifest_sha}\n"),
+        )
+        .unwrap();
+        fs::write(next_payload.join("MANIFEST.txt"), manifest).unwrap();
+        fs::set_permissions(&next_payload, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::remove_file(payload_root.join("current")).unwrap();
+        std::os::unix::fs::symlink("versions/0.2.29-next", payload_root.join("current")).unwrap();
+        fs::write(pi.join("APPEND_SYSTEM.md"), "host-canonical-v2\n").unwrap();
         let second = wrap_worker_command("pi".into(), vec![], Some("two")).unwrap();
+        assert_eq!(
+            fs::read_to_string(&append_system).unwrap(),
+            "host-canonical-v2\n"
+        );
+        assert_eq!(
+            fs::metadata(&append_system).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         unsafe { std::env::set_var(ROOT_ENV, &workspace_b) };
+        unsafe { std::env::set_var("FAKE_PODMAN_PAYLOAD_MODE", "legacy-image") };
+        let error = match wrap_worker_command("pi".into(), vec![], Some("one")) {
+            Ok(_) => panic!("new workspace accepted a legacy image"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("does not declare io.hcom.payload-mode")
+        );
+        unsafe { std::env::set_var("FAKE_PODMAN_PAYLOAD_MODE", PODMAN_PAYLOAD_MODE) };
         let third = wrap_worker_command("pi".into(), vec![], Some("one")).unwrap();
 
-        let id_a = workspace_id(&workspace_a.canonicalize().unwrap());
         let id_b = workspace_id(&workspace_b.canonicalize().unwrap());
         assert_eq!(first.command, bin.join("podman").to_string_lossy());
         assert!(first.args.iter().any(|arg| arg == &format!("hcs-{id_a}")));
@@ -1028,12 +1915,27 @@ exit 45
                 .windows(2)
                 .any(|w| w == ["--workdir", workspace_a.to_string_lossy().as_ref()])
         );
-        let root = home
-            .join(".local/share/hcom-sandbox/workspaces")
-            .join(&id_a);
         for env in [
             "HOME=/home/pi",
+            &format!(
+                "PATH={}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                root.join("pi-agent/bin").display()
+            ),
+            &format!(
+                "XDG_CONFIG_HOME={}",
+                root.join("pi-agent/.config").display()
+            ),
+            &format!("XDG_CACHE_HOME={}", root.join("cache").display()),
+            &format!(
+                "XDG_DATA_HOME={}",
+                root.join("pi-agent/.local/share").display()
+            ),
+            &format!(
+                "XDG_STATE_HOME={}",
+                root.join("pi-agent/.local/state").display()
+            ),
             &format!("PI_CODING_AGENT_DIR={}", root.join("pi-agent").display()),
+            &format!("PI_FRAMEWORK_PAYLOAD={PODMAN_PAYLOAD_CONTAINER_ROOT}"),
             &format!("HCOM_CLIENT_DIR={}", root.join("hcom-client").display()),
             &format!("HCOM_DIR={}", root.join("hcom-client").display()),
             "HCOM_PROCESS_ID",
@@ -1041,6 +1943,7 @@ exit 45
             "HCOM_TAG",
             "HCOM_BROKER_SOCKET",
             "HCOM_BROKER_TOKEN_FILE",
+            "HCOM_BRIDGE_TOKEN_FILE",
             MMX_SOCKET_ENV,
             FLOWUS_SOCKET_ENV,
         ] {
@@ -1053,6 +1956,15 @@ exit 45
                 .iter()
                 .any(|arg| arg == "PI_CODING_AGENT_SESSION_DIR")
         );
+        let staged_hcom = root.join("pi-agent/bin/hcom");
+        assert_eq!(
+            fs::metadata(&staged_hcom).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read(&staged_hcom).unwrap(),
+            fs::read(std::env::current_exe().unwrap()).unwrap()
+        );
 
         let contents = fs::read_to_string(&log).unwrap();
         let create_lines: Vec<_> = contents
@@ -1063,6 +1975,10 @@ exit 45
         let create_a = create_lines
             .iter()
             .find(|line| line.contains(&format!("hcs-{id_a}")))
+            .unwrap();
+        let create_b = create_lines
+            .iter()
+            .find(|line| line.contains(&format!("hcs-{id_b}")))
             .unwrap();
         assert!(create_a.contains("--user\t0:0"));
         assert!(!create_a.contains("--userns=keep-id"));
@@ -1081,6 +1997,18 @@ exit 45
         ] {
             assert!(create_a.contains(&mount), "missing {mount} in {create_a}");
         }
+        let payload_mount = format!("{}:{PODMAN_PAYLOAD_CONTAINER_ROOT}:ro", payload.display());
+        assert!(
+            create_a.contains(&payload_mount),
+            "missing {payload_mount} in {create_a}"
+        );
+        assert!(create_a.contains(&format!("io.hcom.payload-root={}", payload.display())));
+        let next_payload_mount = format!(
+            "{}:{PODMAN_PAYLOAD_CONTAINER_ROOT}:ro",
+            next_payload.display()
+        );
+        assert!(create_b.contains(&next_payload_mount));
+        assert!(!create_a.contains(&next_payload_mount));
         let broker_root = broker_socket.parent().unwrap();
         assert!(create_a.contains(&format!(
             "{}:{}:ro",
@@ -1196,6 +2124,51 @@ exit 45
                 0o700
             );
         }
+        let legacy_workspace = temp.path().join("workspace-legacy");
+        fs::create_dir(&legacy_workspace).unwrap();
+        unsafe {
+            std::env::remove_var(PODMAN_PAYLOAD_ROOT_ENV);
+            std::env::set_var(ROOT_ENV, &legacy_workspace);
+        }
+        let legacy_id = workspace_id(&legacy_workspace.canonicalize().unwrap());
+        let legacy_container = state.join(format!("hcs-{legacy_id}"));
+        fs::create_dir_all(&legacy_container).unwrap();
+        fs::write(legacy_container.join("id"), format!("{legacy_id}\n")).unwrap();
+        fs::write(
+            legacy_container.join("path"),
+            format!("{}\n", legacy_workspace.display()),
+        )
+        .unwrap();
+        fs::write(legacy_container.join("payload"), "\n").unwrap();
+        fs::write(legacy_container.join("running"), "").unwrap();
+        let legacy = wrap_worker_command("pi".into(), vec![], Some("legacy")).unwrap();
+        assert!(
+            !legacy.args.windows(2).any(
+                |window| window[0] == "--env" && window[1].starts_with("PI_FRAMEWORK_PAYLOAD=")
+            )
+        );
+        let log_after_legacy = fs::read_to_string(&log).unwrap();
+        assert!(
+            !log_after_legacy
+                .lines()
+                .any(|line| line.starts_with("create\t")
+                    && line.contains(&format!("hcs-{legacy_id}")))
+        );
+
+        let missing_workspace = temp.path().join("workspace-missing-payload");
+        fs::create_dir(&missing_workspace).unwrap();
+        unsafe { std::env::set_var(ROOT_ENV, &missing_workspace) };
+        let error = match wrap_worker_command("pi".into(), vec![], Some("missing")) {
+            Ok(_) => panic!("new workspace accepted a missing payload"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Podman payload is not initialized")
+        );
+        let missing_id = workspace_id(&missing_workspace.canonicalize().unwrap());
+        assert!(!state.join(format!("hcs-{missing_id}")).exists());
     }
 
     #[test]

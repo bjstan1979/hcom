@@ -1,68 +1,69 @@
-# Podman workspace worker image
+# Podman workspace base and Pi payload
 
-This directory contains source-only image assets. It does not alter the release bundle.
+The Podman workspace is split into two artifacts:
 
-Generate a context from the installed live Pi/HCOM runtime:
+- **Stable base image:** Ubuntu 24.04, Node 22, tini, Git, bridge shim, thin `pi` launcher, and workspace bootstrap.
+- **Versioned payload:** Pi runtime, extensions, managed npm packages, configuration, FlowUs skills, and pinned local Git bundles.
 
-```sh
-packaging/podman-workspace/build-context.sh /tmp/hcom-pi-image
-podman build -t localhost/hcom-pi-workspace:live /tmp/hcom-pi-image
+Package, extension, skill, and Pi runtime updates only create a new payload. They do not rebuild the base image.
+
+## Build the stable base
+
+```bash
+context=$(mktemp -d)
+podman-workspace/build-context.sh "$context"
+base_sha=$(tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+  -C "$context" -cf - . | sha256sum | cut -d' ' -f1)
+podman build \
+  --build-arg HCOM_IMAGE_RELEASE=development \
+  --build-arg HCOM_BASE_CONTEXT_SHA256="$base_sha" \
+  -t localhost/hcom-pi-workspace:live "$context"
+rm -rf "$context"
 ```
 
-The generator copies the live `pi` and `hcom` executables plus the Pi
-`extensions`, `agents`, `npm`, and settings seed. Extension package links that
-resolve outside the Pi directory are materialized with their production
-dependency closure. Git metadata is removed. Override `HCOM_BIN`,
-`PI_PACKAGE_DIR`, or `PI_CODING_AGENT_DIR` when the live installation is
-elsewhere. Credentials, sessions, HCOM state, and mutable runtime state are not
-baked into the image. Workspace state is seeded once, except the HCOM-owned
-`extensions/hcom.ts`, which is refreshed from the image on every Pi start so a
-rebuilt image can deliver integration and security fixes without overwriting
-other extensions or user settings.
+Rebuild only when `Containerfile`, a launcher/bootstrap, or the FlowUs shim changes. `install.sh` and release preparation reuse any image whose base-context SHA and payload-mode label match; Bundle release-label changes alone never rebuild it.
 
-Install the launchers and run:
+## Materialize a payload
 
-```sh
-install -m 0755 scripts/hcom-podman-sandbox ~/.local/bin/
-install -m 0755 scripts/hcom-sandbox ~/.local/bin/
-install -m 0755 scripts/hcom-happy-sandbox scripts/hcom-happy-pi \
-  scripts/hcom-happy-pi-rpc ~/.local/bin/
-hcom-sandbox --workspace /path/to/project 1 pi
+From an installed or extracted Pi Framework Bundle:
+
+```bash
+bundle=$HOME/.local/share/pi-framework
+payload_root=${HCOM_PODMAN_PAYLOAD_ROOT:-$HOME/.local/share/hcom-sandbox/payloads}
+"$bundle/podman-workspace/materialize-payload.sh" "$bundle" "$payload_root"
+readlink "$payload_root/current"
 ```
 
-`hcom-sandbox` defaults to `podman-workspace`; use `--mode workspace` for the
-legacy bubblewrap sandbox or `--mode off` explicitly. Podman mode creates one
-persistent container per canonical workspace, seeds workspace-private
-`auth.json` and `models.json` once with mode 0600, and uses a user-systemd
-broker service. Host HCOM DB/key are never mounted. Rootless namespace uid 0
-maps to the launching host user; all capabilities are dropped, no-new-privileges
-is set, and the root filesystem is read-only.
+The materializer:
 
-## Happy mobile + HCOM
+- fingerprints `MANIFEST.txt` as `<bundle-version>-<20-char-manifest-sha>`;
+- writes `versions/<payload-id>` under an exclusive `flock`;
+- rejects credentials, HCOM state, Git metadata, dangling links, and links escaping the payload;
+- makes the completed tree read-only;
+- atomically replaces only the `current` symlink;
+- never changes or deletes an existing version directory.
 
-Keep Happy and `pi-acp` on the host while the Pi RPC process runs in the same
-Podman workspace sandbox and binds to HCOM through the Pi extension:
+## Container lifecycle
 
-```sh
-hcom-happy-sandbox --workspace /path/to/project
-hcom-happy-sandbox --workspace /path/to/project \
-  --session 01a0387b-6ec0-7421-afd1-4fe665227c50
-```
+`hcom-podman-sandbox` exports the payload root. HCOM resolves and validates `current` while holding the workspace creation lock. A new `hcs-<workspace-id>` container binds that exact version directory read-only at `/opt/pi-payload` and records its host path in `io.hcom.payload-root`. New containers fail closed if `current` is missing or the selected image lacks `io.hcom.payload-mode=readonly-host-bind`.
 
-The second form opens the requested existing Pi session in Happy. It is distinct
-from `happy resume <happy-session-id>`: `--session` selects the Pi transcript
-and lets HCOM restore that transcript's canonical identity. Do not concurrently
-open the same Pi session through both the interactive TUI and Happy. Happy's ACP path stays on the host
-as the encrypted mobile transport and does not engage its Claude/Codex sandbox
-manager; the Pi process remains inside the rootless, capability-free,
-read-only-rootfs HCOM Podman sandbox. HCOM delivery is plugin-only in this mode,
-so messages are sent
-to the same Pi RPC session rather than injected into Happy's host terminal.
+Existing containers remain pinned to their recorded payload even after `current` changes. Existing legacy containers without the label continue using their image-baked runtime; they are not stopped or replaced automatically. To migrate a workspace, stop its agents and remove only its `hcs-*` container. The next launch preserves host-backed workspace state and pins the then-current payload.
 
-Optional runtime settings: `HCOM_PODMAN_IMAGE`, `HCOM_PODMAN_STATE_ROOT`,
-`HCOM_PODMAN_PIDS_LIMIT`, `HCOM_PODMAN_MEMORY`, and `HCOM_PODMAN_CPUS`.
+Do not delete an old `payloads/versions/*` directory while either `current` or any container's `io.hcom.payload-root` label references it. Payload garbage collection is intentionally manual.
 
-Workspace containers intentionally survive agent exits and image rebuilds. To
-move a workspace to a rebuilt image, stop its agents and remove only the
-`hcs-<workspace-id>` container; the next launch recreates it while preserving
-the host backing state under `HCOM_PODMAN_STATE_ROOT`.
+On each Pi start, `pi-container-entry` takes the workspace refresh `flock` before any mutation, copies first-use configuration, and refreshes managed package, Git, integration, and FlowUs skill trees through staged swaps with signal rollback and next-start crash recovery. Unrelated user packages and settings are preserved. The host canonical `~/.pi/agent/APPEND_SYSTEM.md` is still synchronized by HCOM with no-follow atomic writes.
+
+## Security boundary
+
+The existing baseline is unchanged:
+
+- rootless Podman;
+- read-only container rootfs and payload mount;
+- `--cap-drop=ALL` and `no-new-privileges`;
+- tini as PID 1;
+- only the canonical workspace and workspace-private Pi/cache/HCOM-client state are writable;
+- host HCOM database, control key, credentials, and session history are never mounted in the payload.
+
+Optional settings: `HCOM_PODMAN_IMAGE`, `HCOM_PODMAN_PAYLOAD_ROOT`, `HCOM_PODMAN_STATE_ROOT`, `HCOM_PODMAN_PIDS_LIMIT`, `HCOM_PODMAN_MEMORY`, and `HCOM_PODMAN_CPUS`.
+
+Happy and `pi-acp` remain host-side; only Pi RPC runs in the same rootless Podman workspace.
